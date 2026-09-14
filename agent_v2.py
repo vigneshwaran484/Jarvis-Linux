@@ -1,3 +1,4 @@
+import json
 import re
 import requests
 import subprocess
@@ -22,6 +23,7 @@ from wakeword import (
     get_microphone_index, get_microphone_details
 )
 from memory import MemoryManager
+from tts_stream import StreamingSpeaker
 from jarvis_log import log
 from config import (
     SCREENSHOT_DIR, VIDEO_DIR,
@@ -38,9 +40,10 @@ from config import (
 #   ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock) instead of
 #   shelling out to hyprctl/ydotool — e.g. focus_window|title, move_to_workspace|n,
 #   list_windows|. Register them in TOOLS and the SYSTEM_PROMPT tool list.
-# TODO(streaming-tts): edge_tts.Communicate.stream() yields audio chunks; pipe
-#   them into a persistent `mpv --idle` (or pygame stream) so speech starts
-#   before synthesis finishes. speak() is the single choke point to change.
+# DONE(streaming-tts): sentence-pipelined playback implemented in
+#   tts_stream.py (StreamingSpeaker), fed from ask_llm()'s Ollama streaming
+#   mode via the _DoneSpeechRouter below. speak() itself is unchanged and
+#   still used for short deterministic messages and as the fallback path.
 
 # Suppress ALSA warnings emitted by C libraries during audio initialization
 import ctypes
@@ -76,9 +79,17 @@ def hud(state, detail=""):
 async def _speak_edge(text, tmp_path):
     await edge_tts.Communicate(text, TTS_VOICE).save(str(tmp_path))
 
-def speak(text, then=None):
-    """Synthesise + play `text`. HUD shows SPEAKING, then returns to `then`
-    (or whatever state was active before the call)."""
+def speak(text, then=None, gen_start_ts=None):
+    """Synthesise + play `text` as a single blocking clip. HUD shows SPEAKING,
+    then returns to `then` (or whatever state was active before the call).
+
+    Used for short deterministic messages (memory confirmations, errors) and
+    as the fallback when streaming TTS (see run_agent/StreamingSpeaker) isn't
+    used or its first chunk fails. gen_start_ts, if given, is logged against
+    the moment playback actually starts — lets jarvis.log show this old
+    blocking path's full latency for comparison against streaming's
+    'first audio playback started' log line.
+    """
     print(f"🔊 Jarvis: {text}")
     log.info("SPEAK: %s", text)
 
@@ -88,6 +99,9 @@ def speak(text, then=None):
     tmp_path = Path("_jarvis_response.mp3")
     try:
         asyncio.run(_speak_edge(text, tmp_path))
+        if gen_start_ts is not None:
+            log.info("Blocking TTS: audio playback started %.2fs after generation began",
+                     time.time() - gen_start_ts)
         # Use mpv for reliable audio playback on Linux
         subprocess.run(["mpv", "--no-terminal", "--quiet", str(tmp_path)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -166,21 +180,55 @@ class LLMError(RuntimeError):
     """Raised by ask_llm; message is a short reason (unreachable | timeout | error: ...)."""
 
 
-def ask_llm(messages):
+def ask_llm(messages, on_token=None):
+    """
+    Call Ollama's /api/chat in streaming mode. If `on_token` is given, it's
+    invoked with each incremental text chunk as it arrives — this is what
+    lets run_agent() pipeline TTS playback while generation is still in
+    progress (see _DoneSpeechRouter below).
+
+    Always returns the FULL accumulated response text (stripped), exactly
+    like the old blocking (stream=False) version did — the ReAct loop's
+    TOOL:/DONE: parsing further down is untouched, it still runs on this
+    complete string after ask_llm() returns. Only how the bytes arrive
+    changed, not the response contract.
+    """
     try:
         resp = requests.post(
             LLM_ENDPOINT,
-            json={"model": LLM_MODEL, "messages": messages, "stream": False},
+            json={"model": LLM_MODEL, "messages": messages, "stream": True},
             timeout=LLM_TIMEOUT,
+            stream=True,
         )
         resp.raise_for_status()
-        return resp.json()["message"]["content"].strip()
+
+        parts = []
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                log.warning("Ollama stream: unparseable line, skipping: %r", line[:200])
+                continue
+
+            token = data.get("message", {}).get("content", "")
+            if token:
+                parts.append(token)
+                if on_token:
+                    on_token(token)
+            if data.get("done"):
+                break
+
+        return "".join(parts).strip()
     except requests.exceptions.ConnectionError as e:
         log.error("Ollama unreachable at %s: %s", LLM_ENDPOINT, e)
         raise LLMError("unreachable")
     except requests.exceptions.Timeout:
         log.error("Ollama timed out after %.0fs (model=%s)", LLM_TIMEOUT, LLM_MODEL)
         raise LLMError("timeout")
+    except LLMError:
+        raise
     except Exception as e:
         log.exception("LLM error")
         raise LLMError(f"error: {e}")
@@ -709,6 +757,60 @@ You: DONE: Your project uses Postgres.
 
 
 # ─────────────────────────────────────────
+# 5b. STREAMING-SPEECH ROUTER
+# ─────────────────────────────────────────
+
+class _DoneSpeechRouter:
+    """
+    Watches the incremental tokens of ONE ask_llm() call (one ReAct step).
+    If the response turns out to start with 'DONE' — i.e. it's the final
+    spoken reply, not a TOOL: call — it engages a StreamingSpeaker and feeds
+    it the spoken text as it streams in, so playback of the first sentence
+    starts while the LLM is still generating the rest.
+
+    This only ever affects DONE: responses. A TOOL: call (or anything else)
+    causes zero audio side effects — ask_llm() still returns the complete
+    accumulated text exactly as before, and run_agent()'s existing
+    TOOL:/DONE: parsing runs on it completely unchanged.
+    """
+    _PREFIX = "DONE"
+
+    def __init__(self, gen_start_ts):
+        self._gen_start_ts = gen_start_ts
+        self._buffer = ""
+        self._decided = False
+        self.is_done_response = False
+        self.speaker: StreamingSpeaker | None = None
+
+    def on_token(self, token: str):
+        if self._decided:
+            if self.is_done_response:
+                self.speaker.feed(token)
+            return
+
+        self._buffer += token
+        stripped = self._buffer.lstrip()
+        if len(stripped) < len(self._PREFIX):
+            return  # not enough yet to tell TOOL:/DONE apart
+
+        self._decided = True
+        if stripped.startswith(self._PREFIX):
+            self.is_done_response = True
+            # Mirror the exact stripping run_agent() applies to the full
+            # response text below: response[4:].lstrip(":. ")
+            remainder = stripped[len(self._PREFIX):].lstrip(":. ")
+            self.speaker = StreamingSpeaker(
+                voice=TTS_VOICE,
+                on_first_audio=lambda: hud(HUDState.SPEAKING),
+                on_finished=lambda: hud(HUDState.LISTENING),
+                gen_start_ts=self._gen_start_ts,
+            )
+            if remainder:
+                self.speaker.feed(remainder)
+        # else: a TOOL: call or a malformed response — no speech, no speaker.
+
+
+# ─────────────────────────────────────────
 # 6. AGENT LOOP
 # ─────────────────────────────────────────
 
@@ -747,10 +849,19 @@ def run_agent(user_goal):
 
     for step in range(LLM_MAX_STEPS):
         hud(HUDState.THINKING, f"step {step+1}: ollama")
+        step_start = time.time()
+        log.info("Generation started (step %d)", step + 1)
+        router = _DoneSpeechRouter(gen_start_ts=step_start)
         try:
-            response = ask_llm(messages)
+            response = ask_llm(messages, on_token=router.on_token)
         except LLMError as e:
             reason = str(e)
+            if router.speaker is not None:
+                # Drop anything not yet queued; already-fully-formed sentences
+                # already playing finish naturally rather than cutting off
+                # mid-word. Don't speak the trailing fragment — the error
+                # message below is what should be heard next.
+                router.speaker.abort()
             hud(HUDState.ERROR, f"ollama {reason}")
             if reason == "unreachable":
                 speak("I'm having trouble thinking right now. Ollama doesn't seem to be running.", then=HUDState.ERROR)
@@ -802,7 +913,20 @@ def run_agent(user_goal):
             if not final:
                 final = "Done."
             _memory.record_exchange(user_goal, final)
-            speak(final)
+
+            # router.speaker was fed this exact text as it streamed in, and
+            # (per HUD requirement) already flipped the HUD to SPEAKING the
+            # moment the first sentence started playing — well before this
+            # point, which is only reached once the FULL response finished
+            # generating. finish() blocks until all queued audio has played,
+            # then returns False only if the very first chunk failed to
+            # synthesize, in which case we fall back to one plain blocking
+            # speak() call so the reply is never silently dropped.
+            spoken_via_stream = False
+            if router.speaker is not None:
+                spoken_via_stream = router.speaker.finish(default_text_if_empty=final)
+            if not spoken_via_stream:
+                speak(final, gen_start_ts=step_start)
             return final
 
         else:
