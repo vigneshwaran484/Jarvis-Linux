@@ -13,6 +13,7 @@ the same HUD queue as agent_v2's main loop — no race conditions.
 import threading
 import time
 import numpy as np
+import pyaudio
 from pathlib import Path
 
 from config import STT_LANGUAGE, WAKEWORD_ENABLED, WAKEWORD_THRESHOLD
@@ -28,24 +29,79 @@ WAKEWORD_SAMPLE_RATE = 16000  # openWakeWord's models are trained on 16kHz and h
 
 
 # ─────────────────────────────────────────
-# Microphone setup (reused from previous code)
+# Microphone setup
 # ─────────────────────────────────────────
 
+# PipeWire exposes a JACK-compatible server that PortAudio's JACK backend
+# can see and enumerate with attractive names (e.g. "AB13X Headset Adapter
+# Mono") — but on this system, opening ANY device under that hostAPI
+# reliably crashes the process with heap corruption (verified directly: a
+# minimal PyAudio open()+read() reproduces it every time, independent of
+# SpeechRecognition). Never open a device on this hostAPI.
+_UNSAFE_HOST_APIS = {"jack audio connection kit"}
+
+# Within the safe ALSA hostAPI, these ALSA PCM plugin names route through
+# PipeWire's real audio graph — following whatever device the user has
+# actually set as default input, with transparent rate conversion — rather
+# than grabbing a raw hw:X,Y device directly. A raw hw: device can open
+# without error yet capture near-silence, because PipeWire normally holds
+# the physical card for its own exclusive use (verified: hw:0,0 on this
+# machine opens fine but reads a near-zero noise floor, while pw-record
+# against the named PipeWire device captures real audio at the same time).
+_PREFERRED_ALSA_NAMES = ("pulse", "default")
+
+
+def _safe_input_devices():
+    """Yield (index, name) for every input-capable device whose hostAPI
+    isn't the one known to crash PortAudio on this system."""
+    pa = pyaudio.PyAudio()
+    try:
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) <= 0:
+                continue
+            host_api = pa.get_host_api_info_by_index(info["hostApi"])["name"]
+            if host_api.strip().lower() in _UNSAFE_HOST_APIS:
+                continue
+            yield i, info["name"]
+    finally:
+        pa.terminate()
+
+
 def get_microphone_details():
-    """Get microphone index and sample rate, prioritizing USB/headset."""
+    """
+    Pick a (device_index, sample_rate) to open for microphone capture.
+
+    Deliberately prefers ALSA's 'pulse'/'default' PCM plugin — which
+    forwards to PipeWire's real audio graph — over both a raw hw:X,Y
+    device and any device on PipeWire's JACK-compatibility hostAPI. See
+    the module-level comments above _UNSAFE_HOST_APIS and
+    _PREFERRED_ALSA_NAMES for what each of those choices avoids; both were
+    found by direct testing, not by assumption.
+    """
     import sys
-    if sys.platform.startswith("linux"):
-        names = sr.Microphone.list_microphone_names()
-        # Priority 1: Hardware USB / Headset mic devices requiring 48kHz
-        for i, name in enumerate(names):
-            nlower = name.lower()
-            if any(k in nlower for k in ["usb", "headset", "adapter"]):
+    if not sys.platform.startswith("linux"):
+        return None, 16000
+
+    try:
+        devices = list(_safe_input_devices())
+    except Exception as e:
+        log.exception("Failed to enumerate audio input devices: %s", e)
+        return None, 16000
+
+    for name_target in _PREFERRED_ALSA_NAMES:
+        for i, name in devices:
+            if name.strip().lower() == name_target:
                 return i, 48000
-        # Priority 2: Fallback to PulseAudio or Default
-        for target in ["pulse", "default"]:
-            for i, name in enumerate(names):
-                if name.lower() == target:
-                    return i, 16000
+
+    # No 'pulse'/'default' plugin found (unusual) — fall back to whatever
+    # safe device remains rather than failing outright.
+    if devices:
+        i, name = devices[0]
+        log.warning("No ALSA 'pulse'/'default' device found; falling back to %r (idx %d)", name, i)
+        return i, 48000
+
+    log.error("No safe input device found — every input-capable device was on an unsafe hostAPI")
     return None, 16000
 
 
