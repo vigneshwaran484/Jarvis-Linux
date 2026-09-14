@@ -23,3 +23,4 @@ sentence-transformers>=3.0.0
 
 # Wake word detection (Part 4) — CPU-only, offline, lightweight
 openwakeword>=0.5.0
+audioop-lts>=0.2.0  # Python 3.13+ removed stdlib audioop; needed to resample mic audio to 16kHz

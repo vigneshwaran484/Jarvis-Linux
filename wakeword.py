@@ -19,6 +19,13 @@ from config import STT_LANGUAGE, WAKEWORD_ENABLED, WAKEWORD_THRESHOLD
 from jarvis_log import log
 import speech_recognition as sr
 
+try:
+    import audioop  # stdlib on Python <3.13; the audioop-lts backport on 3.13+
+except ImportError:
+    audioop = None
+
+WAKEWORD_SAMPLE_RATE = 16000  # openWakeWord's models are trained on 16kHz and hard-assume it
+
 
 # ─────────────────────────────────────────
 # Microphone setup (reused from previous code)
@@ -102,13 +109,15 @@ class WakeWordDetector:
             log.exception("Failed to load wake word models: %s", e)
             self.enabled = False
 
-    def predict(self, audio_data: np.ndarray, sample_rate: int = 16000) -> dict:
+    def predict(self, audio_data: np.ndarray) -> dict:
         """
         Run inference on a chunk of audio.
 
         Args:
-            audio_data: numpy array of PCM audio (mono or stereo)
-            sample_rate: sample rate in Hz (default 16000)
+            audio_data: numpy int16 array of raw 16kHz mono PCM audio. openWakeWord's
+                        preprocessor hard-requires dtype int16 (it raises ValueError on
+                        float input) and always assumes a 16kHz sample rate internally —
+                        there is no sample_rate parameter on Model.predict().
 
         Returns:
             dict with model predictions (keys are model names, values are scores 0-1)
@@ -118,15 +127,15 @@ class WakeWordDetector:
 
         try:
             with self._lock:
-                predictions = self.model.predict(audio_data, sample_rate=sample_rate)
+                predictions = self.model.predict(audio_data)
             return predictions
         except Exception as e:
             log.error("Error during wake word inference: %s", e)
             return {}
 
-    def is_detected(self, audio_data: np.ndarray, sample_rate: int = 16000) -> bool:
+    def is_detected(self, audio_data: np.ndarray) -> bool:
         """Check if the wake word was detected above threshold."""
-        predictions = self.predict(audio_data, sample_rate)
+        predictions = self.predict(audio_data)
         if not predictions or self.model_name not in predictions:
             return False
         score = predictions[self.model_name]
@@ -183,41 +192,85 @@ def listen_for_wake_word_continuous(on_detected, on_error=None):
     print("👂 Listening for wake word...")
     log.info("Wake word listener started (model=%s, threshold=%.2f)", _detector.model_name, _detector.threshold)
 
-    mic_idx, sample_rate = get_microphone_details()
+    # openWakeWord's models are trained on 16kHz audio and hard-require it (no
+    # sample_rate parameter exists on Model.predict() — it assumes 16kHz always).
+    # Some USB/headset mics on this machine refuse to open at 16kHz at all (PyAudio
+    # fails silently, stream ends up None) — get_microphone_details() already
+    # discovered the rate each device actually needs (e.g. 48kHz). So we capture
+    # at THAT native rate and resample down to 16kHz ourselves before inference,
+    # rather than fighting the hardware.
+    mic_idx, native_rate = get_microphone_details()
+    if native_rate != WAKEWORD_SAMPLE_RATE and audioop is None:
+        reason = "audioop unavailable — cannot resample mic audio to 16kHz for openWakeWord"
+        log.error(reason)
+        if on_error:
+            on_error(reason)
+        return
 
     try:
         _recognizer = sr.Recognizer()
-        with sr.Microphone(device_index=mic_idx, sample_rate=sample_rate) as source:
+        with sr.Microphone(device_index=mic_idx, sample_rate=native_rate) as source:
             # One-time ambient noise calibration
             _recognizer.adjust_for_ambient_noise(source, duration=0.5)
 
+            resample_state = None  # audioop.ratecv carries state across calls for a smoother resample
+            consecutive_errors = 0
             while True:
                 try:
-                    # Capture audio without blocking forever on silence
-                    audio = _recognizer.listen(source, timeout=5, max_seconds=0.5)
+                    # Capture a short phrase (SpeechRecognition's listen() blocks until
+                    # speech starts, then returns at silence or phrase_time_limit).
+                    # NOTE: this is phrase-triggered, not fixed-size streaming — it's a
+                    # reasonable fit for openWakeWord's frame-based predict() but the
+                    # built-in energy-threshold VAD can clip the very start of the
+                    # wake word. A raw continuous PCM stream (e.g. pyaudio directly,
+                    # feeding fixed 80ms frames) would be more responsive; TODO for a
+                    # follow-up pass if false negatives turn out to be common.
+                    audio = _recognizer.listen(source, timeout=5, phrase_time_limit=1.5)
+                    raw_bytes = audio.get_raw_data()  # 16-bit PCM at native_rate
 
-                    # Convert audio to numpy array for openWakeWord
-                    audio_data = np.frombuffer(audio.get_raw_data(), dtype=np.int16).astype(np.float32)
-                    audio_data /= 32768  # Normalize to [-1, 1]
+                    if native_rate != WAKEWORD_SAMPLE_RATE:
+                        raw_bytes, resample_state = audioop.ratecv(
+                            raw_bytes, 2, 1, native_rate, WAKEWORD_SAMPLE_RATE, resample_state
+                        )
+
+                    # openWakeWord requires raw int16 PCM — NOT normalized float32.
+                    # Its preprocessor raises ValueError on any other dtype.
+                    audio_data = np.frombuffer(raw_bytes, dtype=np.int16)
 
                     # Run detection
-                    if _detector.is_detected(audio_data, sample_rate):
+                    if _detector.is_detected(audio_data):
                         print("✅ Wake word detected!")
                         log.info("Wake word detection triggered")
                         on_detected()
                         return  # Exit listener thread
 
+                    consecutive_errors = 0  # reset on any successful iteration
+
                 except sr.WaitTimeoutError:
                     # Timeout is normal during silence
+                    consecutive_errors = 0
                     continue
                 except sr.UnknownValueError:
                     # Speech detected but too quiet; try next chunk
+                    consecutive_errors = 0
                     continue
                 except sr.RequestError:
                     # No internet (shouldn't happen since we're CPU-only)
+                    consecutive_errors = 0
                     continue
                 except Exception as e:
-                    log.warning("Audio processing error: %s (will retry)", e)
+                    # A persistent bug here (e.g. a bad API kwarg) would otherwise spin
+                    # in a tight loop and flood jarvis.log. Back off, and after enough
+                    # consecutive failures, give up and let the caller fall back.
+                    consecutive_errors += 1
+                    log.warning("Audio processing error (%d in a row): %s", consecutive_errors, e)
+                    if consecutive_errors >= 10:
+                        reason = f"Repeated audio processing errors: {e}"
+                        log.error("%s — giving up on wake word listener", reason)
+                        if on_error:
+                            on_error(reason)
+                        return
+                    time.sleep(min(0.5 * consecutive_errors, 5))
                     continue
 
     except Exception as e:
