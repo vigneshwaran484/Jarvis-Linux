@@ -19,7 +19,12 @@ TTS_VOICE        = os.getenv("TTS_VOICE", "en-AU-WilliamNeural")
 STT_LANGUAGE     = os.getenv("STT_LANGUAGE", "en-IN")        # Indian English — better accuracy for you
 PHRASE_TIME_LIMIT = int(os.getenv("PHRASE_TIME_LIMIT", "10"))   # max seconds per spoken command
 
-# ── Wake word ───────────────────────────────────────────────────────────────
+# ── Wake word (openWakeWord) ────────────────────────────────────────────────
+WAKEWORD_ENABLED      = os.getenv("WAKEWORD_ENABLED", "true").lower() in ("1", "true", "yes")
+WAKEWORD_MODEL        = os.getenv("WAKEWORD_MODEL", "hey_jarvis")  # see github.com/dscripka/openWakeWord for available models
+WAKEWORD_THRESHOLD    = float(os.getenv("WAKEWORD_THRESHOLD", "0.5"))  # detection confidence (0-1, higher = stricter)
+
+# ── Legacy wake words (Google STT fallback) ───────────────────────────────────
 WAKE_WORDS = ["hey jarvis", "jarvis", "jar vis", "hey jervis", "jervis", "hi jarvis", "hey harvest", "travis", "service"]
 
 

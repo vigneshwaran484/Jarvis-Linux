@@ -16,21 +16,24 @@ from pathlib import Path
 from datetime import datetime
 
 from reactor import ArcReactor, HUDState
-from wakeword import listen_for_wake_word_multi, get_microphone_index, get_microphone_details
+from wakeword import (
+    listen_for_wake_word_continuous, listen_for_wake_word_google_stt,
+    init_detector, is_detector_ready,
+    get_microphone_index, get_microphone_details
+)
 from memory import MemoryManager
 from jarvis_log import log
 from config import (
     SCREENSHOT_DIR, VIDEO_DIR,
     LLM_MODEL, LLM_ENDPOINT, LLM_MAX_STEPS, LLM_TIMEOUT,
     TTS_VOICE, STT_LANGUAGE, PHRASE_TIME_LIMIT, STT_MIN_CONFIDENCE,
+    WAKEWORD_ENABLED, WAKEWORD_MODEL, WAKEWORD_THRESHOLD,
     WAKE_WORDS, ALLOWED_APPS, ALLOWED_WRITE_EXTENSIONS,
 )
 
-# TODO(wake-word): swap listen_for_wake_word_multi (Google STT polling) for an
-#   offline engine — Porcupine (pvporcupine.create(keywords=["jarvis"])) or
-#   openWakeWord (Model(wakeword_models=["hey_jarvis"])). Both expose a
-#   per-frame predict() that fits the same `block until detected` contract used
-#   in agent_loop(), so only wakeword.py needs to change.
+# DONE(wake-word): implemented openWakeWord-based detection in wakeword.py
+#   Falls back to Google STT if openWakeWord model fails to load.
+#   Hotkey (SUPER+J) remains as a manual override/fallback.
 # TODO(hyprland-ipc): add tools that talk to Hyprland over its IPC socket
 #   ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock) instead of
 #   shelling out to hyprctl/ydotool — e.g. focus_window|title, move_to_workspace|n,
@@ -822,10 +825,12 @@ def run_agent(user_goal):
 if __name__ == "__main__":
     import sys
 
-    log.info("=== Jarvis starting (model=%s, stt=%s, tts=%s) ===", LLM_MODEL, STT_LANGUAGE, TTS_VOICE)
+    log.info("=== Jarvis starting (model=%s, stt=%s, tts=%s, wake_word=%s) ===",
+             LLM_MODEL, STT_LANGUAGE, TTS_VOICE, WAKEWORD_MODEL if WAKEWORD_ENABLED else "disabled")
     reactor = ArcReactor()
     _reactor = reactor                     # module globals used by speak()/hud()
     _memory = MemoryManager()              # loads FAISS + JSON stores, warms embedder in background
+    init_detector()                        # initialize openWakeWord model (CPU-only, background thread)
 
     # Spoken prompts for each listen() failure reason (Part 3.1)
     LISTEN_ERRORS = {
@@ -842,20 +847,49 @@ if __name__ == "__main__":
 
         while True:
             hud(HUDState.IDLE)
-            print("\n😴 Idle — say 'Hey Jarvis' to wake up")
+            print("\n😴 Idle — say 'Hey Jarvis' to wake up (or press Super+J)")
 
-            # TODO(wake-word): this blocks on Google STT; replace with Porcupine/openWakeWord (see header).
-            try:
-                listen_for_wake_word_multi(WAKE_WORDS)
-            except Exception:
-                log.exception("Wake-word listener crashed; retrying in 3s")
-                reactor.flash_error("wake word", 3)
-                time.sleep(3)
+            # Wake word detection (openWakeWord or Google STT fallback)
+            wake_detected = False
+
+            def on_wake_word_detected():
+                """Callback when openWakeWord detects the wake word."""
+                nonlocal wake_detected
+                wake_detected = True
+
+            def on_wake_word_error(reason):
+                """Callback if wake word detection fails; fall back to Google STT."""
+                nonlocal wake_detected
+                log.warning("Wake word detection failed (%s); falling back to Google STT", reason)
+                hud(HUDState.ERROR, f"wake word: {reason}")
+                time.sleep(1)
+                # Fall back to Google STT polling
+                try:
+                    if listen_for_wake_word_google_stt(WAKE_WORDS):
+                        wake_detected = True
+                except Exception as e:
+                    log.exception("Google STT fallback also failed: %s", e)
+                    wake_detected = False
+
+            # Try openWakeWord-based detection first
+            if is_detector_ready():
+                log.info("Using openWakeWord for wake word detection (model=%s, threshold=%.2f)",
+                         WAKEWORD_MODEL, WAKEWORD_THRESHOLD)
+                listen_for_wake_word_continuous(on_wake_word_detected, on_wake_word_error)
+            else:
+                # Fall back to Google STT if openWakeWord is disabled or failed to load
+                log.info("openWakeWord not ready; using Google STT fallback")
+                if listen_for_wake_word_google_stt(WAKE_WORDS):
+                    wake_detected = True
+
+            if wake_detected:
+                print("✅ Wake word detected!")
+                log.info("Wake word detected — transitioning to listening")
+                speak("Yes, I'm listening.", then=HUDState.LISTENING)
+            else:
+                log.warning("Wake word detection ended without trigger (may be user abort or timeout)")
+                time.sleep(1)
                 continue
-
-            print("✅ Wake word detected!")
-            log.info("Wake word detected")
-            speak("Yes, I'm listening.", then=HUDState.LISTENING)
 
             silent_rounds = 0
             while True:
