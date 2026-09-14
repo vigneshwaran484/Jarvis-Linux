@@ -75,12 +75,19 @@ pip install -r requirements.txt
 ### Run
 
 ```bash
-# Interactive mode (console + HUD window)
+# Interactive mode (console + HUD window) — use the venv's python, NOT the system one
 .venv/bin/python agent_v2.py
 
-# Or via hotkey (if you have Hyprland configured)
+# or activate the venv first, then plain `python` works:
+source .venv/bin/activate
+python agent_v2.py
+
+# Or via hotkey (Hyprland, bound in ~/.config/hypr/hyprland/keybinds.lua)
 super+shift+j
 ```
+
+> `ModuleNotFoundError: No module named 'speech_recognition'` means you ran the
+> system `python` instead of the venv's — every dependency lives in `.venv/`.
 
 Say **"Hey Jarvis"** to wake up, then speak your command.
 
@@ -134,7 +141,7 @@ The Arc Reactor GUI shows live pipeline state:
 | `search_web` | Open Google search in your browser |
 | `get_system_stats` | CPU, RAM, disk usage |
 | `get_weather` | Current weather (via Open-Meteo, no API key) |
-| `take_screenshot` | Save to `$HOME/Desktop/jarvis/photo/` |
+| `take_screenshot` | Save to `~/Pictures/jarvis/` |
 | `start_recording` / `stop_recording` | Screen capture (wf-recorder) |
 | `write_file` / `read_file` | Safe file I/O (.txt, .md, .json, .csv, .log only) |
 | `get_datetime` | Current date and time |
@@ -175,8 +182,8 @@ EMBEDDING_MODEL=all-MiniLM-L6-v2      # sentence-transformers model
 # Output
 LOG_FILE=jarvis.log
 LOG_LEVEL=INFO
-SCREENSHOT_DIR=~/Desktop/jarvis/photo
-VIDEO_DIR=~/Desktop/jarvis/video
+SCREENSHOT_DIR=~/Pictures/jarvis
+VIDEO_DIR=~/Videos/jarvis
 ```
 
 ---

@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", r"C:\Users\vigne\OneDrive\Documents\jarvis\photo"))
-VIDEO_DIR      = Path(os.getenv("VIDEO_DIR", r"C:\Users\vigne\OneDrive\Documents\jarvis\video"))
+SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "~/Pictures/jarvis")).expanduser()
+VIDEO_DIR      = Path(os.getenv("VIDEO_DIR", "~/Videos/jarvis")).expanduser()
 
 # ── LLM ────────────────────────────────────────────────────────────────────
 LLM_MODEL    = os.getenv("LLM_MODEL", "llama3.2")
@@ -29,15 +29,18 @@ WAKE_WORDS = ["hey jarvis", "jarvis", "jar vis", "hey jervis", "jervis", "hi jar
 
 
 # ── Allowed apps (security allowlist) ──────────────────────────────────────
+# Maps a spoken app name to the Linux process name close_app() should match.
 ALLOWED_APPS = {
-    "notepad":        "notepad.exe",
-    "calculator":     "calc.exe",
-    "explorer":       "explorer.exe",
-    "spotify":        "Spotify.exe",
-    "chrome":         "chrome.exe",
-    "brave":          "brave.exe",
-    "vscode":         "Code.exe",
-    "android studio": "studio64.exe",
+    "notepad":        "kate",
+    "calculator":     "kcalc",
+    "explorer":       "thunar",
+    "terminal":       "kitty",
+    "spotify":        "spotify",
+    "chrome":         "chrome",
+    "brave":          "brave",
+    "firefox":        "firefox",
+    "vscode":         "code",
+    "android studio": "studio.sh",
 }
 
 # ── Allowed file extensions for write_file ──────────────────────────────────

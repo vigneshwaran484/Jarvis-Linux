@@ -14,7 +14,6 @@ import threading
 import time
 import numpy as np
 import pyaudio
-from pathlib import Path
 
 from config import STT_LANGUAGE, WAKEWORD_ENABLED, WAKEWORD_THRESHOLD
 from jarvis_log import log
@@ -263,6 +262,7 @@ def listen_for_wake_word_continuous(on_detected, on_error=None):
             on_error(reason)
         return
 
+    giveup_reason = None  # set inside the mic block; on_error is called only after the mic is released
     try:
         _recognizer = sr.Recognizer()
         with sr.Microphone(device_index=mic_idx, sample_rate=native_rate) as source:
@@ -321,13 +321,16 @@ def listen_for_wake_word_continuous(on_detected, on_error=None):
                     consecutive_errors += 1
                     log.warning("Audio processing error (%d in a row): %s", consecutive_errors, e)
                     if consecutive_errors >= 10:
-                        reason = f"Repeated audio processing errors: {e}"
-                        log.error("%s — giving up on wake word listener", reason)
-                        if on_error:
-                            on_error(reason)
-                        return
+                        giveup_reason = f"Repeated audio processing errors: {e}"
+                        log.error("%s — giving up on wake word listener", giveup_reason)
+                        break  # leave the `with` first so the mic is closed before any fallback opens it
                     time.sleep(min(0.5 * consecutive_errors, 5))
                     continue
+
+        # Mic is released here. Only now hand off to the fallback, which opens its own stream.
+        if giveup_reason and on_error:
+            on_error(giveup_reason)
+        return
 
     except Exception as e:
         reason = f"Microphone error: {e}"

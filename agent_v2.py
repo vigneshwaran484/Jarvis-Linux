@@ -11,8 +11,6 @@ import shutil
 import threading
 import time
 import psutil
-import cv2
-import numpy as np
 from pathlib import Path
 from datetime import datetime
 
@@ -20,7 +18,7 @@ from reactor import ArcReactor, HUDState
 from wakeword import (
     listen_for_wake_word_continuous, listen_for_wake_word_google_stt,
     init_detector, is_detector_ready,
-    get_microphone_index, get_microphone_details
+    get_microphone_details
 )
 from memory import MemoryManager
 from tts_stream import StreamingSpeaker
@@ -131,11 +129,18 @@ def listen():
     try:
         mic_idx, sample_rate = get_microphone_details()
         mic = sr.Microphone(device_index=mic_idx, sample_rate=sample_rate)
-    except Exception as e:
+    except Exception:
         log.exception("Microphone init failed")
         return None, "mic_error"
 
-    with mic as source:
+    try:
+        mic.__enter__()  # opening the stream can itself raise (device busy, unplugged)
+    except Exception:
+        log.exception("Microphone open failed")
+        return None, "mic_error"
+
+    try:
+        source = mic
         print("🎤 Listening...")
         _listen_recognizer.adjust_for_ambient_noise(source, duration=0.3)
         try:
@@ -170,6 +175,11 @@ def listen():
             print(f"⚠️  STT error: {e}")
             log.error("STT request error: %s", e)
             return None, "stt_error"
+    finally:
+        try:
+            mic.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────
@@ -620,10 +630,15 @@ def special_screen(dummy=None):
         return f"Could not toggle special screen: {e}"
 
 
-def remember(text):
+_PLACEHOLDER_ARGS = {"fact", "text", "query", "memory", "argument", "value"}
+
+def remember(text=""):
     """Store an explicit long-term memory."""
-    if not text or not text.strip():
-        return "Nothing to remember."
+    text = (text or "").strip()
+    # Small models sometimes echo the prompt's placeholder ("remember|fact")
+    # instead of a real fact — refuse rather than store junk.
+    if not text or text.lower() in _PLACEHOLDER_ARGS:
+        return "Nothing to remember — say the fact itself, e.g. 'remember that my meeting is at 5'."
     entry = _memory.add_memory(text)
     return f"Remembered: {entry.text}"
 
@@ -878,7 +893,11 @@ def run_agent(user_goal):
         head = response.split("|", 1)[0].strip()
         head_norm = re.sub(r"^tool\s*:\s*", "", head, flags=re.I).strip().lower().replace(" ", "_")
         if response.startswith("TOOL:") or head_norm in TOOLS:
-            body      = re.sub(r"^tool\s*:\s*", "", response, flags=re.I).strip()
+            # A tool call is always a single line. If the model tacks extra
+            # lines on (e.g. "TOOL: remember|fact\nDONE: ..."), ignore them
+            # instead of stuffing them into the tool's argument.
+            first_line = response.strip().splitlines()[0]
+            body      = re.sub(r"^tool\s*:\s*", "", first_line, flags=re.I).strip()
             parts     = body.split("|")
             tool_name = parts[0].strip().lower().replace(" ", "_")
             # tolerate "key=value" / "key: value" style args the model sometimes emits
@@ -947,8 +966,6 @@ def run_agent(user_goal):
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-
     log.info("=== Jarvis starting (model=%s, stt=%s, tts=%s, wake_word=%s) ===",
              LLM_MODEL, STT_LANGUAGE, TTS_VOICE, WAKEWORD_MODEL if WAKEWORD_ENABLED else "disabled")
     reactor = ArcReactor()

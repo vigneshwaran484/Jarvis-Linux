@@ -201,8 +201,6 @@ class ArcReactor:
 
 if __name__ == "__main__":
     # Demo: cycle through every state so you can eyeball the visuals.
-    import threading
-
     app = ArcReactor()
 
     def cycle():
