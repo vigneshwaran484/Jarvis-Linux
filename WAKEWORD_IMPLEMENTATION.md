@@ -284,13 +284,13 @@ See **TEST_WAKEWORD.md** for:
 pip install -r requirements.txt
 
 # Or just the new dependency:
-pip install openwakeword>=0.5.0
+pip install --no-deps "openwakeword>=0.6.0"  # ONNX-only; skips tflite-runtime (no py3.12+ wheels)
 ```
 
 The openWakeWord library:
 - Uses ONNX Runtime for inference
-- Pre-downloads models on first use (~50-100 MB per model)
-- Caches models in `~/.openwakeword/` (auto-created)
+- Downloads models on first use (~1 MB per wake word + ~4 MB shared feature models)
+- Model files live in the package's `openwakeword/resources/models/` (downloaded on first run; ≥0.6 wheels ship none)
 - Supports CPU-only inference natively
 
 ---
@@ -299,7 +299,7 @@ The openWakeWord library:
 
 1. **Install dependencies**:
    ```bash
-   .venv/bin/pip install openwakeword
+   .venv/bin/pip install --no-deps "openwakeword>=0.6.0"
    ```
 
 2. **Test wake word**:

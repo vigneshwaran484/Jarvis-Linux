@@ -22,5 +22,17 @@ faiss-cpu>=1.8.0
 sentence-transformers>=3.0.0
 
 # Wake word detection (Part 4) — CPU-only, offline, lightweight
-openwakeword>=0.5.0
+#
+# openwakeword itself is deliberately NOT listed here. Its PyPI metadata
+# hard-requires tflite-runtime on Linux, and tflite-runtime publishes no
+# wheels for Python 3.12+, so `pip install openwakeword` fails on a modern
+# interpreter. We run it in ONNX-only mode (wakeword.py passes
+# inference_framework="onnx"), which needs none of tflite. Install it
+# without its declared deps AFTER this file, via install.sh or by hand:
+#     pip install --no-deps "openwakeword>=0.6.0"
+# Its real runtime deps for the ONNX path are pinned here instead:
+onnxruntime>=1.10.0,<2
+scipy>=1.3,<2
+scikit-learn>=1,<2
+tqdm>=4.0,<5
 audioop-lts>=0.2.0  # Python 3.13+ removed stdlib audioop; needed to resample mic audio to 16kHz

@@ -6,7 +6,7 @@ This document describes how to verify the openWakeWord-based wake word detection
 ## Prerequisites
 - Ollama running: `ollama serve`
 - Jarvis environment initialized: `.venv/bin/python agent_v2.py`
-- openWakeWord installed: `pip install openwakeword`
+- openWakeWord installed (ONNX-only, no tflite-runtime): `pip install --no-deps "openwakeword>=0.6.0"`
 
 ## Test 1: Wake Word Detection (Core Feature)
 
@@ -41,8 +41,8 @@ This document describes how to verify the openWakeWord-based wake word detection
 ### Steps:
 1. Rename/corrupt the ONNX model files:
    ```bash
-   mkdir -p ~/.openwakeword  # typical cache location
-   # Move files if they exist
+   # models live inside the venv: .venv/lib/python3.*/site-packages/openwakeword/resources/models/
+   # temporarily rename hey_jarvis_v0.1.onnx there (wakeword.py will re-download it on next start)
    ```
 2. Start Jarvis again
 3. Expected behavior:
@@ -205,7 +205,7 @@ Detector ready: True
 
 | Problem | Check | Fix |
 |---------|-------|-----|
-| "openwakeword not installed" | `pip list \| grep openwakeword` | `pip install openwakeword` |
+| "openwakeword not installed" | `pip list \| grep openwakeword` | `pip install --no-deps "openwakeword>=0.6.0"` |
 | Wake word never triggers | Check threshold in logs | Adjust `WAKEWORD_THRESHOLD` |
 | Too many false positives | Background noise triggers detection | Increase threshold to 0.6-0.7 |
 | Hotkey doesn't work | `grep "SUPER + J" ~/.config/hypr/hyprland/keybinds.lua` | Verify Hyprland config |

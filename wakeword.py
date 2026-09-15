@@ -10,6 +10,7 @@ The hotkey (SUPER+J) remains as a fallback if wake word fails.
 Threading: runs on 'wakeword' daemon thread, enqueues state changes through
 the same HUD queue as agent_v2's main loop — no race conditions.
 """
+import os
 import threading
 import time
 import numpy as np
@@ -126,6 +127,7 @@ class WakeWordDetector:
         self.threshold = threshold
         self.model = None
         self.enabled = False
+        self._pred_key = None   # key openwakeword uses for this model in predict() output
         self._lock = threading.Lock()
         self._load_model()
 
@@ -139,25 +141,47 @@ class WakeWordDetector:
                      self.model_name, self.threshold)
             t0 = time.time()
 
-            # openWakeWord.Model loads all available pre-trained models by default.
-            # It defaults to CPU when CUDA is unavailable.
-            self.model = Model()
+            import openwakeword
+            from openwakeword.utils import download_models
+
+            if self.model_name not in openwakeword.MODELS:
+                log.warning("Wake word model '%s' unknown. Available: %s. Using 'hey_jarvis'.",
+                            self.model_name, list(openwakeword.MODELS))
+                self.model_name = "hey_jarvis"
+
+            # openwakeword >= 0.6 ships NO model files in its wheel — every model
+            # (the wake word itself plus the shared melspectrogram/embedding
+            # feature models) must be fetched once from the project's GitHub
+            # releases. download_models() is idempotent: it only downloads
+            # files that aren't already present, so this is a no-op after the
+            # first run. It needs internet exactly once (~10 MB total).
+            onnx_path = openwakeword.MODELS[self.model_name]["model_path"].replace(".tflite", ".onnx")
+            if not os.path.exists(onnx_path):
+                log.info("Wake word model files missing — downloading '%s' (first run only)", self.model_name)
+                download_models([self.model_name])
+
+            # ONNX only. The library's default is inference_framework="tflite",
+            # which needs tflite-runtime — a package with no wheels for
+            # Python 3.12+ on Linux, so a clean install can never satisfy it.
+            # The ONNX path uses onnxruntime (CPU wheels for every current
+            # Python) and every pre-trained model is published in both formats.
+            # Load ONLY the one model we listen for: cheaper than loading all
+            # of them, and immune to any other model's file being absent.
+            self.model = Model(wakeword_models=[onnx_path], inference_framework="onnx")
+            # When a model is loaded by path, openwakeword keys its predictions by the
+            # file stem ("hey_jarvis_v0.1"), not the friendly name ("hey_jarvis").
+            # Look the key up once here rather than guessing it in is_detected().
+            self._pred_key = next(iter(self.model.models))
             self.enabled = True
 
             elapsed = time.time() - t0
-            available_models = list(self.model.models.keys())
-            if self.model_name not in available_models:
-                log.warning(
-                    "Wake word model '%s' not available. Available: %s. Using 'hey_jarvis' as fallback.",
-                    self.model_name, available_models
-                )
-                self.model_name = "hey_jarvis"
-            log.info("Wake word models loaded successfully in %.1fs (available: %s)", elapsed, available_models)
+            log.info("Wake word model '%s' loaded (ONNX, CPU, key=%s) in %.1fs",
+                     self.model_name, self._pred_key, elapsed)
 
         except ImportError:
             log.error(
                 "openwakeword not installed. Wake word detection disabled. "
-                "Install with: pip install openwakeword"
+                'Install with: pip install --no-deps "openwakeword>=0.6.0"'
             )
             self.enabled = False
         except Exception as e:
@@ -191,9 +215,9 @@ class WakeWordDetector:
     def is_detected(self, audio_data: np.ndarray) -> bool:
         """Check if the wake word was detected above threshold."""
         predictions = self.predict(audio_data)
-        if not predictions or self.model_name not in predictions:
+        if not predictions or self._pred_key not in predictions:
             return False
-        score = predictions[self.model_name]
+        score = predictions[self._pred_key]
         detected = score >= self.threshold
         if detected:
             log.info("Wake word detected! Score: %.3f (threshold: %.2f)", score, self.threshold)

@@ -65,12 +65,30 @@ cd Jarvis-Linux
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install CPU torch first (keeps VRAM free for Ollama)
-pip install --index-url https://download.pytorch.org/whl/cpu torch
-
-# Install the rest
-pip install -r requirements.txt
+# One-shot install (CPU torch first so VRAM stays free for Ollama, then
+# requirements.txt, then openwakeword without its tflite-runtime dependency)
+./install.sh
 ```
+
+Or the same steps by hand:
+
+```bash
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install -r requirements.txt
+pip install --no-deps "openwakeword>=0.6.0"
+```
+
+> **Why `--no-deps` for openwakeword?** Its PyPI metadata requires
+> `tflite-runtime` on Linux, which has no wheels for Python 3.12+. Jarvis runs
+> openWakeWord in ONNX-only mode (`inference_framework="onnx"`), which never
+> imports tflite, so that dependency is simply skipped. `pip check` will keep
+> reporting it as missing — that's expected and harmless.
+>
+> **Model files:** openwakeword ≥ 0.6 ships no model files in its wheel.
+> `install.sh` downloads the `hey_jarvis` model (~10 MB, from the project's
+> GitHub releases), and `wakeword.py` re-downloads automatically if the files
+> are ever missing — so the very first run needs internet once. Everything
+> after that is fully offline.
 
 ### Run
 
