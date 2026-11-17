@@ -47,3 +47,6 @@ scratch/
 # Jarvis runtime data
 memory_data/
 _jarvis_response.mp3
+
+# Local Piper voice models (downloaded, ~60 MB each)
+voices/

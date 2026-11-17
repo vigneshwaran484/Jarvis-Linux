@@ -16,7 +16,10 @@ import time
 import numpy as np
 import pyaudio
 
-from config import STT_LANGUAGE, WAKEWORD_ENABLED, WAKEWORD_THRESHOLD
+import collections
+import re
+
+from config import STT_LANGUAGE, WAKEWORD_ENABLED, WAKEWORD_THRESHOLD, WAKEWORD_CONFIRM_THRESHOLD
 from jarvis_log import log
 import speech_recognition as sr
 
@@ -26,6 +29,11 @@ except ImportError:
     audioop = None
 
 WAKEWORD_SAMPLE_RATE = 16000  # openWakeWord's models are trained on 16kHz and hard-assume it
+WAKE_BUFFER_SECONDS = 2.5     # audio kept for the Whisper confirmation of a borderline score
+WAKE_CONFIRM_TAIL_FRAMES = 4  # frames (~0.3 s) to keep recording after a borderline score, so "Jarvis" is complete
+WAKE_CONFIRM_COOLDOWN = 1.5   # seconds between confirmations, so room chatter cannot keep Whisper busy
+MIC_SETTLE_SECONDS = 0.3      # audio discarded right after the mic opens (start-up click)
+WAKEWORD_FRAME_MS = 80        # openWakeWord's native frame: 1280 samples at 16 kHz
 
 
 # ─────────────────────────────────────────
@@ -49,6 +57,63 @@ _UNSAFE_HOST_APIS = {"jack audio connection kit"}
 # machine opens fine but reads a near-zero noise floor, while pw-record
 # against the named PipeWire device captures real audio at the same time).
 _PREFERRED_ALSA_NAMES = ("pulse", "default")
+
+
+class HighPass:
+    """Streaming high-pass filter for 16-bit mono PCM.
+
+    Some laptop microphones (this machine's built-in digital mic among them)
+    deliver audio riding on a large constant offset: about 6400 out of 32768
+    here. That offset dominates any loudness measurement, so an energy-based
+    voice detector cannot tell speech from silence, and it wastes headroom for
+    the wake word and Whisper models. Removing everything below ~80 Hz takes
+    out the offset and fan rumble and leaves speech untouched."""
+
+    def __init__(self, sample_rate, cutoff_hz=80.0):
+        from scipy.signal import butter, sosfilt_zi
+        self._sos = butter(2, cutoff_hz, btype="highpass", fs=sample_rate, output="sos")
+        self._zi_unit = sosfilt_zi(self._sos)
+        self._zi = None
+
+    def process(self, raw_bytes):
+        from scipy.signal import sosfilt
+        x = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float64)
+        if x.size == 0:
+            return raw_bytes
+        if self._zi is None:
+            # Start in the steady state for the first sample so the offset
+            # does not show up as a loud click at the start of the stream.
+            self._zi = self._zi_unit * x[0]
+        y, self._zi = sosfilt(self._sos, x, zi=self._zi)
+        return np.clip(y, -32768, 32767).astype(np.int16).tobytes()
+
+
+class _FilteredStream:
+    """Wraps SpeechRecognition's microphone stream; read() returns filtered audio."""
+
+    def __init__(self, inner, sample_rate):
+        self._inner = inner
+        self._filter = HighPass(sample_rate)
+
+    def read(self, size):
+        return self._filter.process(self._inner.read(size))
+
+    def close(self):
+        return self._inner.close()
+
+
+class FilteredMicrophone(sr.Microphone):
+    """sr.Microphone whose audio passes through HighPass, so Recognizer's
+    energy threshold and everything downstream see offset-free audio."""
+
+    def __enter__(self):
+        super().__enter__()
+        self.stream = _FilteredStream(self.stream, self.SAMPLE_RATE)
+        # The offset ramps up over the first moments after the device opens,
+        # which gets through the filter as a loud click. Throw that away.
+        for _ in range(max(1, int(MIC_SETTLE_SECONDS * self.SAMPLE_RATE / self.CHUNK))):
+            self.stream.read(self.CHUNK)
+        return self
 
 
 def _safe_input_devices():
@@ -212,6 +277,17 @@ class WakeWordDetector:
             log.error("Error during wake word inference: %s", e)
             return {}
 
+    def reset(self):
+        """Clear openWakeWord's rolling audio buffer and score history."""
+        if self.model is not None:
+            with self._lock:
+                self.model.reset()
+
+    def score(self, audio_data: np.ndarray) -> float:
+        """Wake word score (0-1) for the most recent audio, given one more frame."""
+        predictions = self.predict(audio_data)
+        return float(predictions.get(self._pred_key, 0.0)) if predictions else 0.0
+
     def is_detected(self, audio_data: np.ndarray) -> bool:
         """Check if the wake word was detected above threshold."""
         predictions = self.predict(audio_data)
@@ -241,6 +317,32 @@ def init_detector():
 def is_detector_ready():
     """Check if the detector is loaded and ready."""
     return _detector is not None and _detector.enabled
+
+
+# How Whisper tends to spell the name. Deliberately excludes real words such as
+# "service" or "travis": this check must not pass on ordinary conversation.
+_WAKE_NAME_RE = re.compile(r"\b(jarvis|jervis|jarves|jarvus|javis|jarviss|jar vis)\b")
+
+
+def confirms_wake(text):
+    """True if a transcript contains the assistant's name."""
+    return bool(_WAKE_NAME_RE.search(re.sub(r"[^a-z ]", " ", (text or "").lower())))
+
+
+def _whisper_confirms(frames_16k):
+    """Transcribe the buffered audio locally and check it for the wake name."""
+    try:
+        import voice_local
+        if not voice_local.stt_ready():
+            return False
+        audio = sr.AudioData(b"".join(frames_16k), WAKEWORD_SAMPLE_RATE, 2)
+        text, _conf = voice_local.transcribe(audio)
+    except Exception as e:
+        log.warning("Wake confirmation failed: %s", e)
+        return False
+    ok = confirms_wake(text)
+    log.info("Wake confirmation: heard %r -> %s", text, "wake" if ok else "ignore")
+    return ok
 
 
 # ─────────────────────────────────────────
@@ -286,81 +388,84 @@ def listen_for_wake_word_continuous(on_detected, on_error=None):
             on_error(reason)
         return
 
-    giveup_reason = None  # set inside the mic block; on_error is called only after the mic is released
+    # openWakeWord is a STREAMING detector: it keeps its own rolling audio
+    # buffer and expects a steady feed of 80 ms frames (1280 samples at 16 kHz),
+    # scoring the most recent window on every call. Handing it one whole
+    # "phrase" per call (as an earlier version did via Recognizer.listen)
+    # scores only the trailing silence and never fires. So read fixed-size
+    # frames straight from PyAudio and feed every one of them.
+    frames_native = int(native_rate * WAKEWORD_FRAME_MS / 1000)
+    pa = pyaudio.PyAudio()
+    stream = None
+    giveup_reason = None
     try:
-        _recognizer = sr.Recognizer()
-        with sr.Microphone(device_index=mic_idx, sample_rate=native_rate) as source:
-            # One-time ambient noise calibration
-            _recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=native_rate,
+                         input=True, input_device_index=mic_idx,
+                         frames_per_buffer=frames_native)
+        _detector.reset()            # forget anything heard before (e.g. Jarvis's own voice)
+        highpass = HighPass(native_rate)
+        for _ in range(max(1, int(MIC_SETTLE_SECONDS * 1000 / WAKEWORD_FRAME_MS))):
+            highpass.process(stream.read(frames_native, exception_on_overflow=False))
+        resample_state = None        # audioop.ratecv carries state across calls
+        consecutive_errors = 0
+        recent = collections.deque(maxlen=int(WAKE_BUFFER_SECONDS * 1000 / WAKEWORD_FRAME_MS))
+        confirm_in = None            # frames left before a borderline score is checked with Whisper
+        last_confirm = 0.0
+        while True:
+            try:
+                raw_bytes = highpass.process(stream.read(frames_native, exception_on_overflow=False))
+                if native_rate != WAKEWORD_SAMPLE_RATE:
+                    raw_bytes, resample_state = audioop.ratecv(
+                        raw_bytes, 2, 1, native_rate, WAKEWORD_SAMPLE_RATE, resample_state
+                    )
+                # openWakeWord requires raw int16 PCM — NOT normalized float32.
+                audio_data = np.frombuffer(raw_bytes, dtype=np.int16)
+                recent.append(raw_bytes)
+                score = _detector.score(audio_data)
+                if score >= _detector.threshold:
+                    print("✅ Wake word detected!")
+                    log.info("Wake word detected! Score: %.3f (threshold: %.2f)", score, _detector.threshold)
+                    break
+                if (confirm_in is None and score >= WAKEWORD_CONFIRM_THRESHOLD
+                        and time.time() - last_confirm >= WAKE_CONFIRM_COOLDOWN):
+                    log.info("Borderline wake score %.3f; confirming with Whisper", score)
+                    confirm_in = WAKE_CONFIRM_TAIL_FRAMES
+                elif confirm_in is not None:
+                    confirm_in -= 1
+                    if confirm_in <= 0:
+                        confirm_in, last_confirm = None, time.time()
+                        if _whisper_confirms(list(recent)):
+                            print("✅ Wake word detected (confirmed by Whisper)!")
+                            break
+                        _detector.reset()     # audio piled up while transcribing; start clean
+                consecutive_errors = 0
+            except Exception as e:
+                # A persistent failure would otherwise spin and flood jarvis.log.
+                consecutive_errors += 1
+                log.warning("Audio processing error (%d in a row): %s", consecutive_errors, e)
+                if consecutive_errors >= 10:
+                    giveup_reason = f"Repeated audio processing errors: {e}"
+                    log.error("%s — giving up on wake word listener", giveup_reason)
+                    break
+                time.sleep(min(0.5 * consecutive_errors, 5))
+    except Exception as e:
+        giveup_reason = f"Microphone error: {e}"
+        log.exception(giveup_reason)
+    finally:
+        # Release the mic BEFORE calling back: both on_detected's caller and
+        # the Google STT fallback open their own stream next.
+        try:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+        finally:
+            pa.terminate()
 
-            resample_state = None  # audioop.ratecv carries state across calls for a smoother resample
-            consecutive_errors = 0
-            while True:
-                try:
-                    # Capture a short phrase (SpeechRecognition's listen() blocks until
-                    # speech starts, then returns at silence or phrase_time_limit).
-                    # NOTE: this is phrase-triggered, not fixed-size streaming — it's a
-                    # reasonable fit for openWakeWord's frame-based predict() but the
-                    # built-in energy-threshold VAD can clip the very start of the
-                    # wake word. A raw continuous PCM stream (e.g. pyaudio directly,
-                    # feeding fixed 80ms frames) would be more responsive; TODO for a
-                    # follow-up pass if false negatives turn out to be common.
-                    audio = _recognizer.listen(source, timeout=5, phrase_time_limit=1.5)
-                    raw_bytes = audio.get_raw_data()  # 16-bit PCM at native_rate
-
-                    if native_rate != WAKEWORD_SAMPLE_RATE:
-                        raw_bytes, resample_state = audioop.ratecv(
-                            raw_bytes, 2, 1, native_rate, WAKEWORD_SAMPLE_RATE, resample_state
-                        )
-
-                    # openWakeWord requires raw int16 PCM — NOT normalized float32.
-                    # Its preprocessor raises ValueError on any other dtype.
-                    audio_data = np.frombuffer(raw_bytes, dtype=np.int16)
-
-                    # Run detection
-                    if _detector.is_detected(audio_data):
-                        print("✅ Wake word detected!")
-                        log.info("Wake word detection triggered")
-                        on_detected()
-                        return  # Exit listener thread
-
-                    consecutive_errors = 0  # reset on any successful iteration
-
-                except sr.WaitTimeoutError:
-                    # Timeout is normal during silence
-                    consecutive_errors = 0
-                    continue
-                except sr.UnknownValueError:
-                    # Speech detected but too quiet; try next chunk
-                    consecutive_errors = 0
-                    continue
-                except sr.RequestError:
-                    # No internet (shouldn't happen since we're CPU-only)
-                    consecutive_errors = 0
-                    continue
-                except Exception as e:
-                    # A persistent bug here (e.g. a bad API kwarg) would otherwise spin
-                    # in a tight loop and flood jarvis.log. Back off, and after enough
-                    # consecutive failures, give up and let the caller fall back.
-                    consecutive_errors += 1
-                    log.warning("Audio processing error (%d in a row): %s", consecutive_errors, e)
-                    if consecutive_errors >= 10:
-                        giveup_reason = f"Repeated audio processing errors: {e}"
-                        log.error("%s — giving up on wake word listener", giveup_reason)
-                        break  # leave the `with` first so the mic is closed before any fallback opens it
-                    time.sleep(min(0.5 * consecutive_errors, 5))
-                    continue
-
-        # Mic is released here. Only now hand off to the fallback, which opens its own stream.
-        if giveup_reason and on_error:
+    if giveup_reason:
+        if on_error:
             on_error(giveup_reason)
         return
-
-    except Exception as e:
-        reason = f"Microphone error: {e}"
-        log.exception(reason)
-        if on_error:
-            on_error(reason)
+    on_detected()
 
 
 # ─────────────────────────────────────────
@@ -388,7 +493,7 @@ def listen_for_wake_word_google_stt(wake_words=None, timeout_seconds=300):
     mic_idx, sample_rate = get_microphone_details()
     start_time = time.time()
 
-    with sr.Microphone(device_index=mic_idx, sample_rate=sample_rate) as source:
+    with FilteredMicrophone(device_index=mic_idx, sample_rate=sample_rate) as source:
         _recognizer.adjust_for_ambient_noise(source, duration=0.5)
 
         while time.time() - start_time < timeout_seconds:

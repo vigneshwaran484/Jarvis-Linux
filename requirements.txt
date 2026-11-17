@@ -9,7 +9,10 @@
 requests>=2.31.0
 SpeechRecognition>=3.10.0
 PyAudio>=0.2.13  # wakeword.py enumerates hostAPI info directly to avoid a PipeWire/JACK-backend crash
-edge-tts>=6.1.9
+edge-tts>=6.1.9           # online TTS, kept as the fallback for piper
+faster-whisper>=1.1.0     # on-device speech-to-text (CTranslate2, runs on the CPU)
+kokoro-onnx>=0.4.0        # on-device text-to-speech, more natural than piper (ONNX, CPU)
+piper-tts>=1.3.0          # on-device text-to-speech (ONNX, runs on the CPU)
 pygame>=2.5.0
 psutil>=5.9.0
 numpy>=1.24.0

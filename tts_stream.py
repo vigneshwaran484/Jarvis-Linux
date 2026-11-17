@@ -52,6 +52,31 @@ from typing import Optional
 import edge_tts
 
 from jarvis_log import log
+from config import TTS_ENGINE
+
+
+def synthesize_clip(text: str, voice: str) -> tuple[bytes, str]:
+    """One piece of text -> (audio bytes, file extension).
+
+    Uses the on-device voice when TTS_ENGINE is piper or kokoro, and falls back
+    to edge-tts (online) if that engine is not installed or fails, so a missing
+    voice file never leaves Jarvis mute."""
+    if TTS_ENGINE in ("piper", "kokoro"):
+        try:
+            import voice_local
+            return voice_local.synthesize(text), "wav"
+        except Exception as e:
+            log.warning("Local TTS failed (%s); falling back to edge-tts", e)
+    return asyncio.run(_edge_synthesize(text, voice)), "mp3"
+
+
+async def _edge_synthesize(text: str, voice: str) -> bytes:
+    communicate = edge_tts.Communicate(text, voice)
+    buf = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.extend(chunk["data"])
+    return bytes(buf)
 
 # ─────────────────────────────────────────
 # Sentence splitting
@@ -238,10 +263,10 @@ class StreamingSpeaker:
                 continue
 
             try:
-                audio_bytes = asyncio.run(self._synthesize(sentence))
+                audio_bytes, ext = synthesize_clip(sentence, self.voice)
                 if not audio_bytes:
-                    raise RuntimeError("edge-tts returned no audio data")
-                tmp_path = self._tmp_dir / f"_jarvis_stream_{index}.mp3"
+                    raise RuntimeError("TTS returned no audio data")
+                tmp_path = self._tmp_dir / f"_jarvis_stream_{index}.{ext}"
                 tmp_path.write_bytes(audio_bytes)
                 self._audio_q.put((index, tmp_path))
                 if index == 0:
@@ -251,14 +276,6 @@ class StreamingSpeaker:
                 if index == 0:
                     self._first_chunk_ok = False
                     log.error("Streaming TTS: first chunk failed — caller will fall back to whole-response speak()")
-
-    async def _synthesize(self, sentence: str) -> bytes:
-        communicate = edge_tts.Communicate(sentence, self.voice)
-        buf = bytearray()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                buf.extend(chunk["data"])
-        return bytes(buf)
 
     # ── playback thread: strictly in order, back-to-back ──
     def _play_worker(self):
