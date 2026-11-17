@@ -23,7 +23,7 @@ from wakeword import (
     get_microphone_details, FilteredMicrophone
 )
 from memory import MemoryManager
-from tts_stream import StreamingSpeaker, synthesize_clip
+from tts_stream import StreamingSpeaker, synthesize_clip, play_file, current_epoch, stop_speaking
 import voice_local
 from jarvis_log import log
 from circuit_breaker import CircuitBreaker, CircuitOpenError
@@ -112,6 +112,7 @@ def speak(text, then=None, gen_start_ts=None):
     log.info("SPEAK: %s", text)
 
     prev_state = then or (_reactor.state if _reactor else None)
+    epoch = current_epoch()          # a barge-in stop after this point cancels this clip
     hud(HUDState.SPEAKING)
 
     # Unique temp file: a fixed ./_jarvis_response.mp3 depended on the cwd and
@@ -126,9 +127,8 @@ def speak(text, then=None, gen_start_ts=None):
         if gen_start_ts is not None:
             log.info("Blocking TTS: audio playback started %.2fs after generation began",
                      time.time() - gen_start_ts)
-        # Use mpv for reliable audio playback on Linux
-        subprocess.run(["mpv", "--no-terminal", "--quiet", str(tmp_path)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # mpv, registered so stop_speaking() (HUD click / Esc / SIGUSR1) can cut it off
+        play_file(tmp_path, epoch)
     except Exception as e:
         print(f"⚠️  TTS error: {e}")
         log.exception("TTS failure")
@@ -1259,6 +1259,16 @@ def describe_calendar_item(item):
     return text
 
 
+def on_stop_speaking():
+    """Barge-in from the HUD (orb click / Esc) or SIGUSR1. Returns True if
+    something was playing, so an orb click on a silent Jarvis keeps its
+    normal behaviour."""
+    stopped = stop_speaking()
+    if stopped:
+        hud_log("SYS", "Speech stopped.")
+    return stopped
+
+
 def on_hud_calendar_click(item):
     """Speak the clicked event only while Jarvis is idle. While listening, the
     mic would transcribe Jarvis's own voice as a command; while a request is
@@ -1292,6 +1302,11 @@ if __name__ == "__main__":
     if hasattr(reactor, "set_command_callback"):
         reactor.set_command_callback(run_agent)
     reactor.set_memory_delete_callback(_memory.delete_memory)
+    reactor.set_stop_callback(on_stop_speaking)
+    # Global "shut up" hotkey without focusing the HUD, e.g. a Hyprland bind
+    # running:  pkill -USR1 -f agent_v2.py
+    import signal
+    signal.signal(signal.SIGUSR1, lambda *_: on_stop_speaking())
     reactor.set_event_callback(on_hud_calendar_click)
     init_detector()                        # initialize openWakeWord model (CPU-only, background thread)
     voice_local.warm_up(stt=STT_ENGINE == "whisper", tts=TTS_ENGINE in ("piper", "kokoro"))

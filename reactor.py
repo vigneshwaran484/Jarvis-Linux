@@ -225,7 +225,7 @@ class ArcReactor:
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         self.canvas.bind("<Motion>", self._on_canvas_motion)
         self.root.bind("<F11>", lambda _e: self.toggle_mode())
-        self.root.bind("<Escape>", lambda _e: self._focus_canvas())
+        self.root.bind("<Escape>", self._on_escape)
 
         # Core state
         self.pulse = 0
@@ -243,6 +243,7 @@ class ArcReactor:
         self._wake_callback: Optional[Callable[[], None]] = None
         self._memory_delete_callback: Optional[Callable[[str], bool]] = None
         self._event_callback: Optional[Callable[[dict], None]] = None
+        self._stop_callback: Optional[Callable[[], bool]] = None
         self._armed_delete: tuple[Optional[str], float] = (None, 0.0)   # (memory id, armed at)
         self._refresh_slow = False          # force the 15s memory/calendar tick to run now
         self._hitboxes: list[tuple[float, float, float, float, str, object]] = []
@@ -338,6 +339,12 @@ class ArcReactor:
         would be overwritten by the agent's in-memory copy on its next save."""
         self._memory_delete_callback = callback
 
+    def set_stop_callback(self, callback: Callable[[], bool]):
+        """Register barge-in: called on Esc or an orb click; returns True if
+        speech was playing (an orb click on a silent Jarvis keeps its usual
+        wake behaviour)."""
+        self._stop_callback = callback
+
     def set_event_callback(self, callback: Callable[[dict], None]):
         """Register a callback for a click on a calendar row (gets the event dict)."""
         self._event_callback = callback
@@ -408,6 +415,20 @@ class ArcReactor:
 
     def _focus_canvas(self):
         self.canvas.focus_set()
+
+    def _on_escape(self, _event=None):
+        if self._stop_callback:
+            threading.Thread(target=self._stop_callback, name="hud-stop", daemon=True).start()
+        self._focus_canvas()
+
+    def _on_orb_click(self):
+        """Orb click: interrupt speech if Jarvis is talking, otherwise wake it."""
+        if self._stop_callback and self._stop_callback():
+            return
+        if self._wake_callback:
+            self._wake_callback()
+        else:
+            self.log_event("SYS", "Arc Reactor core pinged — systems nominal.")
 
     def _on_submit_entry(self, _event=None):
         text = self._entry_var.get().strip()
@@ -492,10 +513,7 @@ class ArcReactor:
                 elif hid.startswith("cal:"):
                     self._on_calendar_click(payload)
                 elif hid == "orb_core":
-                    if self._wake_callback:
-                        threading.Thread(target=self._wake_callback, daemon=True).start()
-                    else:
-                        self.log_event("SYS", "Arc Reactor core pinged — systems nominal.")
+                    threading.Thread(target=self._on_orb_click, name="hud-orb", daemon=True).start()
                 return
 
     DELETE_ARM_SECONDS = 4.0

@@ -13,6 +13,11 @@ Public interface:
         .finish(default_text_if_empty=None) -> bool
         .abort()                            — drop anything not yet queued, used
                                                when the underlying generation fails
+    stop_speaking() -> bool                 — barge-in: kill the playing clip and drop
+                                               everything queued or being synthesized,
+                                               in every speaker and in plain speak()
+    play_file(path, epoch) -> bool          — play one clip via mpv, interruptible
+    current_epoch()                         — token a caller takes before synthesizing
 
 Uses edge_tts's Communicate.stream() — the current streaming API (verified
 against the installed edge-tts 7.2.8: Communicate.save() is just a thin
@@ -53,6 +58,65 @@ import edge_tts
 
 from jarvis_log import log
 from config import TTS_ENGINE
+
+
+# ─────────────────────────────────────────
+# Interruptible playback (barge-in)
+# ─────────────────────────────────────────
+#
+# Every mpv process is registered here so stop_speaking() can kill it. The
+# epoch counter covers audio that is not playing yet: a caller takes
+# current_epoch() before it starts synthesizing, and play_file() refuses to
+# start a clip whose epoch is older than the last stop. That way a stop also
+# cancels the sentence currently being synthesized, not just the one playing.
+
+_play_lock = threading.Lock()
+_active_procs: "set[subprocess.Popen]" = set()
+_speech_epoch = 0
+
+
+def current_epoch() -> int:
+    return _speech_epoch
+
+
+def is_speaking() -> bool:
+    with _play_lock:
+        return any(p.poll() is None for p in _active_procs)
+
+
+def stop_speaking() -> bool:
+    """Interrupt all speech now. Returns True if a clip was actually playing."""
+    global _speech_epoch
+    with _play_lock:
+        _speech_epoch += 1
+        procs = [p for p in _active_procs if p.poll() is None]
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    if procs:
+        log.info("Barge-in: stopped speech (%d clip%s playing)", len(procs), "" if len(procs) == 1 else "s")
+    return bool(procs)
+
+
+def play_file(path, epoch: int) -> bool:
+    """Play one audio file with mpv, blocking until it ends or is stopped.
+    Returns False if it was interrupted or skipped because of a stop."""
+    with _play_lock:
+        if epoch != _speech_epoch:
+            return False
+        proc = subprocess.Popen(
+            ["mpv", "--no-terminal", "--quiet", str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        _active_procs.add(proc)
+    try:
+        proc.wait()
+    finally:
+        with _play_lock:
+            _active_procs.discard(proc)
+    return epoch == _speech_epoch
 
 
 def synthesize_clip(text: str, voice: str) -> tuple[bytes, str]:
@@ -170,16 +234,22 @@ class StreamingSpeaker:
         self._first_chunk_ok: Optional[bool] = None   # None=undecided, True/False once chunk 0 resolves
         self._any_sentence_fed = False
         self._finished = False
+        self._epoch = current_epoch()     # a stop_speaking() after this point silences us
 
         self._synth_thread = threading.Thread(target=self._synth_worker, daemon=True, name="tts-synth")
         self._play_thread = threading.Thread(target=self._play_worker, daemon=True, name="tts-play")
         self._synth_thread.start()
         self._play_thread.start()
 
+    @property
+    def stopped(self) -> bool:
+        """True once stop_speaking() was called after this speaker started."""
+        return self._epoch != current_epoch()
+
     # ── feeding ──
     def feed(self, token: str):
         """Call repeatedly as text streams in from the LLM."""
-        if not token:
+        if not token or self.stopped:
             return
         self._text_buffer += token
         sentences, self._text_buffer = split_into_sentences(self._text_buffer, keep_remainder=True)
@@ -211,6 +281,8 @@ class StreamingSpeaker:
         """
         remainder = self._text_buffer.strip()
         self._text_buffer = ""
+        if self.stopped:
+            remainder, default_text_if_empty = "", None
         if remainder:
             self._queue_sentence(remainder)
         elif not self._any_sentence_fed and default_text_if_empty:
@@ -226,7 +298,10 @@ class StreamingSpeaker:
 
         # _first_chunk_ok stays None if nothing was ever queued (empty
         # response, no default given) — treat that as "nothing to fall
-        # back for", i.e. success.
+        # back for", i.e. success. A user stop also counts as success: the
+        # caller must not fall back to speaking the reply it was told to drop.
+        if self.stopped:
+            return True
         return self._first_chunk_ok is not False
 
     def abort(self):
@@ -255,6 +330,9 @@ class StreamingSpeaker:
                 self._audio_q.put(None)
                 return
             index, sentence = item
+
+            if self.stopped:
+                continue          # drain: the user interrupted, synthesize nothing more
 
             if self._first_chunk_ok is False:
                 # First chunk already failed — the caller is falling back to
@@ -285,15 +363,14 @@ class StreamingSpeaker:
                 return
             index, path = item
             try:
+                if self.stopped:
+                    continue      # drain queued clips without playing them (finally deletes)
                 if index == 0:
                     elapsed = time.time() - self._gen_start_ts
                     log.info("Streaming TTS: first audio playback started %.2fs after generation began", elapsed)
                     if self._on_first_audio:
                         self._on_first_audio()
-                subprocess.run(
-                    ["mpv", "--no-terminal", "--quiet", str(path)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+                play_file(path, self._epoch)
             except Exception as e:
                 log.warning("Streaming TTS: playback of chunk %d failed: %s", index, e)
             finally:
