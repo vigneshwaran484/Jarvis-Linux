@@ -982,6 +982,9 @@ You: TOOL: daily_briefing|
 User: Tool result: Now: Monday 2 March, 8:05 AM. Weather in Chennai: clear sky. Temperature 29.0°C... Calendar: Today: 2 events. 10 AM to 11 AM: Lab. 4 PM to 5 PM: Gym. Next up: Lab at 10 AM. Battery is at 80%, charging.
 You: DONE: Good morning, sir. It is 29 degrees and clear in Chennai. You have two things today, a lab at 10 and the gym at 4, with the lab up first. Battery is at 80 percent and charging.
 
+User: skip this song
+You: TOOL: media_next|
+
 User: what windows do I have open?
 You: TOOL: list_windows|
 
