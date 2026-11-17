@@ -29,6 +29,7 @@ from jarvis_log import log
 from circuit_breaker import CircuitBreaker, CircuitOpenError
 import web_search
 import calendar_tool
+import hypr_ipc
 import mail_tool
 from config import (
     SCREENSHOT_DIR, VIDEO_DIR,
@@ -43,10 +44,9 @@ from config import (
 # DONE(wake-word): implemented openWakeWord-based detection in wakeword.py
 #   Falls back to Google STT if openWakeWord model fails to load.
 #   Hotkey (SUPER+J) remains as a manual override/fallback.
-# TODO(hyprland-ipc): add tools that talk to Hyprland over its IPC socket
-#   ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock) instead of
-#   shelling out to hyprctl/ydotool — e.g. focus_window|title, move_to_workspace|n,
-#   list_windows|. Register them in TOOLS and the SYSTEM_PROMPT tool list.
+# DONE(hyprland-ipc): hypr_ipc.py talks to Hyprland's socket directly —
+#   list_windows, focus_window, move_window_to_workspace; change_window and
+#   special_screen use it too (ydotool kept only as a fallback).
 # DONE(streaming-tts): sentence-pipelined playback implemented in
 #   tts_stream.py (StreamingSpeaker), fed from ask_llm()'s Ollama streaming
 #   mode via the _DoneSpeechRouter below. speak() itself is unchanged and
@@ -747,22 +747,27 @@ def simulate_keybind(combo):
     subprocess.run(args, check=True)
 
 def change_window(number="1"):
-    """Change window (win+number)."""
-    simulate_keybind(f"win+{number}")
-    return f"Changed window to {number}."
+    """Switch to workspace N over Hyprland IPC; fall back to the win+N keypress."""
+    try:
+        hypr_ipc.socket_path()
+    except hypr_ipc.HyprError:
+        simulate_keybind(f"win+{number}")      # no Hyprland socket: old keypress path
+        return f"Changed window to {number}."
+    return hypr_ipc.focus_workspace(number)
 
 def change_desktop(number="1"):
     """Change desktop (ctrl+win+number)."""
     simulate_keybind(f"ctrl+win+{number}")
     return f"Changed desktop to {number}."
 
-def special_screen(dummy=None):
-    """Change to special screen (win+s)."""
-    try:
-        subprocess.run(["hyprctl", "dispatch", "togglespecialworkspace"])
-        return "Changed to special screen."
-    except Exception as e:
-        return f"Could not toggle special screen: {e}"
+def special_screen(name=None):
+    """Show / hide a special workspace (default 'special'; 'music' is Spotify's).
+    The old `hyprctl dispatch togglespecialworkspace` is rejected by Hyprland's
+    Lua config syntax, so this goes through hypr_ipc."""
+    name = (name or "").strip().lower()
+    if name in ("", "name", "special", "special screen", "scratchpad"):
+        name = "special"
+    return hypr_ipc.toggle_special(name)
 
 
 _PLACEHOLDER_ARGS = {"fact", "text", "query", "memory", "argument", "value"}
@@ -870,9 +875,14 @@ TOOLS = {
     "media_play_pause":media_play_pause,
     "media_next":      media_next,
     "media_previous":  media_previous,
-    "change_window":   change_window,
+    "change_workspace": change_window,
+    "change_window":   change_window,     # old name, kept so older habits still work
     "change_desktop":  change_desktop,
     "special_screen":  special_screen,
+    "list_windows":    hypr_ipc.list_windows,
+    "focus_window":    hypr_ipc.focus_window,
+    "move_to_workspace": hypr_ipc.move_window_to_workspace,
+    "move_window_to_workspace": hypr_ipc.move_window_to_workspace,
 }
 
 
@@ -910,9 +920,12 @@ AVAILABLE TOOLS:
 - media_play_pause|          (pause or resume the music)
 - media_next|                (skip to the next song / next track / skip this song)
 - media_previous|            (go back to the previous song / last track)
-- change_window|number       (focus window 1-0)
-- change_desktop|number      (switch to workspace / desktop 1-0)
-- special_screen|
+- change_workspace|number    (go / switch to workspace 1-10, e.g. "go to workspace 3")
+- change_desktop|number      (switch to workspace group 1-10)
+- special_screen|name        (show or hide a scratchpad; empty = default, music = Spotify)
+- list_windows|              (what windows / apps are open and on which workspace)
+- focus_window|app_or_title  (jump to an open app: browser, terminal, spotify, vs code, or words from its title)
+- move_to_workspace|number   (move / send THIS window to workspace N, e.g. "send this to workspace 2")
 
 STRICT RESPONSE RULES:
 Rule 1: ALWAYS use a tool to get real information. NEVER make up or assume answers.
@@ -968,6 +981,18 @@ You: TOOL: daily_briefing|
 
 User: Tool result: Now: Monday 2 March, 8:05 AM. Weather in Chennai: clear sky. Temperature 29.0°C... Calendar: Today: 2 events. 10 AM to 11 AM: Lab. 4 PM to 5 PM: Gym. Next up: Lab at 10 AM. Battery is at 80%, charging.
 You: DONE: Good morning, sir. It is 29 degrees and clear in Chennai. You have two things today, a lab at 10 and the gym at 4, with the lab up first. Battery is at 80 percent and charging.
+
+User: what windows do I have open?
+You: TOOL: list_windows|
+
+User: take me to my browser
+You: TOOL: focus_window|browser
+
+User: move this to workspace 3
+You: TOOL: move_to_workspace|3
+
+User: go to workspace 4
+You: TOOL: change_workspace|4
 
 User: who invented the telephone?
 You: TOOL: search_web|who invented the telephone
