@@ -30,6 +30,7 @@ from circuit_breaker import CircuitBreaker, CircuitOpenError
 import web_search
 import calendar_tool
 import hypr_ipc
+import screen_tool
 import mail_tool
 from config import (
     SCREENSHOT_DIR, VIDEO_DIR,
@@ -941,6 +942,7 @@ TOOLS = {
     "change_window":   change_window,     # old name, kept so older habits still work
     "change_desktop":  change_desktop,
     "special_screen":  special_screen,
+    "inspect_screen":  screen_tool.inspect_screen,
     "list_windows":    hypr_ipc.list_windows,
     "focus_window":    hypr_ipc.focus_window,
     "move_to_workspace": hypr_ipc.move_window_to_workspace,
@@ -971,6 +973,7 @@ AVAILABLE TOOLS:
 - get_system_stats|
 - get_weather|city
 - take_screenshot|filename
+- inspect_screen|question    (READ what is on the screen / in this window: errors, code, text. question = what the user asked)
 - start_recording|
 - stop_recording|
 - set_volume|level           (0-100, e.g. 50)
@@ -1004,6 +1007,7 @@ Rule 3: Your ENTIRE response must be ONLY one of these two formats (include the 
 Rule 4: No explanation, no thinking, no extra text — only the single line above.
 Rule 5: Only ONE tool per response.
 Rule 6: After a tool result is given, ALWAYS respond with DONE: followed by a short spoken reply.
+Rule 6b: For inspect_screen results, answer from the screen text in up to three sentences.
 Rule 7: The reply is read aloud: plain words only, no lists, no markdown, no emoji, no symbols
   (say "29 degrees" and "80 percent", never "29°C" or "80%").
   If a calendar result contains CLASHES, always mention the clash.
@@ -1047,6 +1051,12 @@ You: TOOL: daily_briefing|
 
 User: Tool result: Now: Monday 2 March, 8:05 AM. Weather in Chennai: clear sky. Temperature 29.0°C... Calendar: Today: 2 events. 10 AM to 11 AM: Lab. 4 PM to 5 PM: Gym. Next up: Lab at 10 AM. Battery is at 80%, charging.
 You: DONE: Good morning, sir. It is 29 degrees and clear in Chennai. You have two things today, a lab at 10 and the gym at 4, with the lab up first. Battery is at 80 percent and charging.
+
+User: what does this error on my screen mean?
+You: TOOL: inspect_screen|what does this error mean
+
+User: Tool result: Text read from Kitty terminal by OCR... ModuleNotFoundError: No module named 'faiss'
+You: DONE: Python cannot find the faiss package, so it is not installed in the environment you are running. Activate the right virtual environment or install faiss-cpu with pip.
 
 User: skip this song
 You: TOOL: media_next|

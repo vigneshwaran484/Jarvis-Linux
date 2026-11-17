@@ -51,6 +51,10 @@ CASES = [
     ("what do you remember about my project",    "recall_memory",   None),
     ("start recording my screen",                "start_recording", None),
     ("read the file notes.txt",                  "read_file",       "notes"),
+    ("what does this error on my screen mean",   "inspect_screen",  None),
+    ("read what's in this window",               "inspect_screen",  None),
+    ("can you explain the code I'm looking at",  "inspect_screen",  None),
+    ("take a screenshot and save it",            "take_screenshot", None),
 ]
 
 
