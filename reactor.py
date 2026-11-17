@@ -241,6 +241,10 @@ class ArcReactor:
         # Interactive callbacks & hitboxes
         self._command_callback: Optional[Callable[[str], None]] = None
         self._wake_callback: Optional[Callable[[], None]] = None
+        self._memory_delete_callback: Optional[Callable[[str], bool]] = None
+        self._event_callback: Optional[Callable[[dict], None]] = None
+        self._armed_delete: tuple[Optional[str], float] = (None, 0.0)   # (memory id, armed at)
+        self._refresh_slow = False          # force the 15s memory/calendar tick to run now
         self._hitboxes: list[tuple[float, float, float, float, str, object]] = []
         self._hover_id: Optional[str] = None
 
@@ -327,6 +331,16 @@ class ArcReactor:
     def set_wake_callback(self, callback: Callable[[], None]):
         """Register a callback to trigger immediate voice listening."""
         self._wake_callback = callback
+
+    def set_memory_delete_callback(self, callback: Callable[[str], bool]):
+        """Register the function that deletes a long-term memory by id. It must
+        go through the agent's MemoryManager: editing long_term.json from here
+        would be overwritten by the agent's in-memory copy on its next save."""
+        self._memory_delete_callback = callback
+
+    def set_event_callback(self, callback: Callable[[dict], None]):
+        """Register a callback for a click on a calendar row (gets the event dict)."""
+        self._event_callback = callback
 
     def log_event(self, kind: str, text: str):
         """Append an entry to the live ReAct / conversation trace feed (thread-safe)."""
@@ -473,12 +487,54 @@ class ArcReactor:
                     tname = str(payload)
                     self.notify_tool(tname, "manual probe")
                     self.log_event("TOOL", f"Probed node: {tname}")
+                elif hid.startswith("memdel:"):
+                    self._on_memory_delete_click(str(payload))
+                elif hid.startswith("cal:"):
+                    self._on_calendar_click(payload)
                 elif hid == "orb_core":
                     if self._wake_callback:
                         threading.Thread(target=self._wake_callback, daemon=True).start()
                     else:
                         self.log_event("SYS", "Arc Reactor core pinged — systems nominal.")
                 return
+
+    DELETE_ARM_SECONDS = 4.0
+
+    def _on_memory_delete_click(self, memory_id: str):
+        """First click arms the [×], a second click within DELETE_ARM_SECONDS deletes."""
+        armed_id, armed_at = self._armed_delete
+        if armed_id != memory_id or time.time() - armed_at > self.DELETE_ARM_SECONDS:
+            self._armed_delete = (memory_id, time.time())
+            return
+        self._armed_delete = (None, 0.0)
+        if not self._memory_delete_callback:
+            self.log_event("ERR", "Memory delete is not wired to the agent.")
+            return
+        text = next((m.get("text", "") for m in self._memories if m.get("id") == memory_id), memory_id)
+
+        def _run():
+            try:
+                ok = self._memory_delete_callback(memory_id)
+            except Exception as e:
+                self.log_event("ERR", f"Memory delete failed: {e}")
+                return
+            self.log_event("MEM", f"Deleted: {text}" if ok else f"Already gone: {text}")
+            self._refresh_slow = True
+
+        threading.Thread(target=_run, name="hud-memdel", daemon=True).start()
+
+    def _on_calendar_click(self, item):
+        if not isinstance(item, dict):
+            return
+        when = item.get("time_range") or item.get("time", "")
+        line = f"{item.get('day_long', item.get('day', ''))} {when}: {item.get('title', '')}"
+        if item.get("calendar"):
+            line += f" [{item['calendar']}]"
+        if item.get("clash_with"):
+            line += " — CLASHES with " + ", ".join(item["clash_with"])
+        self.log_event("CAL", line)
+        if self._event_callback:
+            threading.Thread(target=self._event_callback, args=(item,), name="hud-cal", daemon=True).start()
 
     def _drain_queue(self):
         while True:
@@ -631,8 +687,9 @@ class ArcReactor:
                 pass
 
             # Slow tick (15s): Long-term FAISS memories + khal calendar events
-            if now - last_slow >= 15.0:
+            if now - last_slow >= 15.0 or self._refresh_slow:
                 last_slow = now
+                self._refresh_slow = False
                 try:
                     if mem_file.exists():
                         raw_m = json.loads(mem_file.read_text(encoding="utf-8"))
@@ -650,12 +707,22 @@ class ArcReactor:
                     formatted = []
                     for e in evts[:6]:
                         day_tag = "TODAY" if e.day == today else "TMRW"
-                        t_str = "ALL DAY" if (e.all_day or not e.start) else e.start
+                        timed = not (e.all_day or not e.start)
+                        t_str = e.start if timed else "ALL DAY"
+                        clash_with = [b.title if a == e else a.title
+                                      for a, b in clashes if e in (a, b)]
                         formatted.append({
                             "day": day_tag,
+                            "day_long": "Today" if e.day == today else "Tomorrow",
+                            "date": e.day.isoformat(),
                             "time": t_str,
+                            "time_range": (f"{e.start}-{e.end}" if timed and e.end and e.end != e.start
+                                           else t_str),
+                            "start": e.start, "end": e.end, "all_day": not timed,
                             "title": e.title,
-                            "clash": any(e in pair for pair in clashes),
+                            "calendar": e.calendar,
+                            "clash": bool(clash_with),
+                            "clash_with": clash_with,
                         })
                     clash_strs = [f"{a.title[:14]} ⚡ {b.title[:14]}" for a, b in clashes[:2]]
                     with self._sys_lock:
@@ -1234,6 +1301,10 @@ class ArcReactor:
                     fill="#d2e8ff",
                     font=("JetBrains Mono", 8),
                 )
+                hid = f"cal:{item.get('date')}:{item.get('time')}:{item['title']}"
+                if self._hover_id == hid:
+                    c.create_rectangle(inner_x1 - 3, cy_cal - 1, inner_x2, cy_cal + 17, outline=row_col)
+                self._hitboxes.append((inner_x1 - 3, cy_cal - 1, inner_x2, cy_cal + 17, hid, item))
                 cy_cal += 21
 
         # Panel 3: FAISS Semantic Memory Vault
@@ -1257,11 +1328,27 @@ class ArcReactor:
                     break
                 cat = (m.get("category") or "fact").upper()[:7]
                 txt = m.get("text") or ""
-                if len(txt) > 30:
-                    txt = txt[:29] + "…"
+                mid = m.get("id") or ""
+                armed_id, armed_at = self._armed_delete
+                armed = bool(mid) and armed_id == mid and time.time() - armed_at <= self.DELETE_ARM_SECONDS
+                if len(txt) > 27:
+                    txt = txt[:26] + "…"
                 c.create_rectangle(inner_x1, cy_mem, inner_x1 + 48, cy_mem + 15, fill="#190d2c", outline="#7b3fe4")
                 c.create_text(inner_x1 + 24, cy_mem + 7.5, text=cat, fill="#d0a2ff", font=("JetBrains Mono", 6, "bold"))
                 c.create_text(inner_x1 + 55, cy_mem + 7.5, text=txt, anchor="w", fill="#cbe2f8", font=("JetBrains Mono", 8))
+                if mid:
+                    # [×] delete: first click arms (turns red, "DEL?"), second click deletes
+                    bw = 30 if armed else 16
+                    bx1, bx2 = inner_x2 - bw, inner_x2
+                    hid = f"memdel:{mid}"
+                    hot = armed or self._hover_id == hid
+                    c.create_rectangle(bx1, cy_mem, bx2, cy_mem + 15,
+                                       fill="#3a0610" if armed else "#140a22",
+                                       outline="#ff384c" if hot else "#5a3a8a")
+                    c.create_text((bx1 + bx2) / 2, cy_mem + 7.5, text="DEL?" if armed else "×",
+                                  fill="#ff384c" if hot else "#a07cd0",
+                                  font=("JetBrains Mono", 7 if armed else 9, "bold"))
+                    self._hitboxes.append((bx1, cy_mem, bx2, cy_mem + 15, hid, mid))
                 cy_mem += 21
 
     def _draw_metric_row(self, c: tk.Canvas, x: float, y: float, w: float, label: str, val_str: str, ratio: float, color: str, hist: list[float]):

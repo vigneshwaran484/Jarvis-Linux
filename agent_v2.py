@@ -1235,6 +1235,46 @@ def _run_agent_locked(user_goal, after_state=None):
 
 
 # ─────────────────────────────────────────
+# 6b. HUD CLICK HANDLERS
+# ─────────────────────────────────────────
+
+def describe_calendar_item(item):
+    """Spoken line for a calendar row clicked in the HUD (dict from reactor)."""
+    title = item.get("title") or "Untitled"
+    day = item.get("day_long") or "Today"
+    if item.get("all_day") or not item.get("start"):
+        text = f"{day}, all day: {title}."
+    else:
+        text = f"{day} at {calendar_tool._spoken_time(item['start'])}"
+        if item.get("end") and item["end"] != item["start"]:
+            text += f" until {calendar_tool._spoken_time(item['end'])}"
+        text += f": {title}."
+    if item.get("calendar"):
+        text += f" It is on your {item['calendar']} calendar."
+    clash = item.get("clash_with") or []
+    if clash:
+        text += " It overlaps with " + " and ".join(clash) + "."
+    else:
+        text += " No clashes."
+    return text
+
+
+def on_hud_calendar_click(item):
+    """Speak the clicked event only while Jarvis is idle. While listening, the
+    mic would transcribe Jarvis's own voice as a command; while a request is
+    running, it would talk over the reply. The details are always in the HUD
+    trace either way."""
+    if _reactor is None or _reactor.state != HUDState.IDLE.value:
+        return
+    if not _agent_lock.acquire(blocking=False):
+        return
+    try:
+        speak(describe_calendar_item(item))
+    finally:
+        _agent_lock.release()
+
+
+# ─────────────────────────────────────────
 # 7. MAIN
 # ─────────────────────────────────────────
 
@@ -1251,6 +1291,8 @@ if __name__ == "__main__":
     _memory = MemoryManager()              # loads FAISS + JSON stores, warms embedder in background
     if hasattr(reactor, "set_command_callback"):
         reactor.set_command_callback(run_agent)
+    reactor.set_memory_delete_callback(_memory.delete_memory)
+    reactor.set_event_callback(on_hud_calendar_click)
     init_detector()                        # initialize openWakeWord model (CPU-only, background thread)
     voice_local.warm_up(stt=STT_ENGINE == "whisper", tts=TTS_ENGINE in ("piper", "kokoro"))
 
