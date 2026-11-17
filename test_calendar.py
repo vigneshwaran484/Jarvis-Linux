@@ -88,5 +88,41 @@ ct.subprocess.run = no_khal
 check(ct.get_calendar("today") == "Could not read the calendar: khal is not installed", "missing khal handled")
 ct.subprocess.run = real
 
+# 6. event creation: date/time parsing (no khal)
+from datetime import datetime
+NOW = datetime(2026, 11, 17, 13, 40)        # a Tuesday afternoon
+TUE, WED, FRI20 = date(2026, 11, 17), date(2026, 11, 18), date(2026, 11, 20)
+ev_cases = [
+    ("tomorrow at 4 pm",              (WED, "16:00", "17:00")),
+    ("tomorrow at 4",                 (WED, "16:00", "17:00")),   # 1-7 without am/pm = PM
+    ("friday 3 to 5 pm",              (FRI20, "15:00", "17:00")),
+    ("friday 10 to 2 pm",             (FRI20, "10:00", "14:00")),
+    ("20 november 10:30 for 2 hours", (FRI20, "10:30", "12:30")),
+    ("tomorrow 4:30pm for 30 minutes",(WED, "16:30", "17:00")),
+    ("wednesday at noon",             (WED, "12:00", "13:00")),
+    ("tomorrow 9.30 am",              (WED, "09:30", "10:30")),
+    ("at 9 am",                       (WED, "09:00", "10:00")),   # passed today, no day said -> tomorrow
+    ("today at 9am",                  (TUE, "09:00", "10:00")),   # said today: kept, with a note
+    ("next monday",                   (date(2026, 11, 23), "", "")),
+]
+for text, want in ev_cases:
+    p = ct.parse_event_time(text, now=NOW)
+    check((p.day, p.start, p.end) == want, f"event time {text!r} -> {p.day} {p.start}-{p.end}")
+check(ct.parse_event_time("today at 9am", now=NOW).notes == ["that time has already passed today"],
+      "past time today is read back")
+for bad in ("this week at 4", "tomorrow at 25"):
+    try:
+        ct.parse_event_time(bad, now=NOW); check(False, f"{bad!r} should be rejected")
+    except ct.EventParseError:
+        check(True, f"{bad!r} rejected")
+for text, title in [("schedule a team sync tomorrow at 4 PM", "team sync"),
+                    ("Lab review on 20 november at 10:30 for 2 hours", "Lab review"),
+                    ("gym at 6", "gym")]:
+    check(ct.strip_when(text) == title, f"title from {text!r} -> {ct.strip_when(text)!r}")
+# the user's own words beat a paraphrased `when` from the model
+ct.fetch_events = lambda start, days=1: []
+p = ct.plan_event("dentist", "friday at 3 pm", now=NOW, user_text="add dentist on friday 3 to 5 pm")
+check((p.start, p.end) == ("15:00", "17:00"), "user's '3 to 5 pm' wins over model's 'at 3 pm'")
+
 print("\nALL PASSED" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

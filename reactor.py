@@ -339,6 +339,10 @@ class ArcReactor:
         would be overwritten by the agent's in-memory copy on its next save."""
         self._memory_delete_callback = callback
 
+    def refresh_panels(self):
+        """Re-read memories and calendar on the next telemetry tick (~1s)."""
+        self._refresh_slow = True
+
     def set_stop_callback(self, callback: Callable[[], bool]):
         """Register barge-in: called on Esc or an orb click; returns True if
         speech was playing (an orb click on a silent Jarvis keeps its usual

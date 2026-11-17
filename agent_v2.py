@@ -811,6 +811,67 @@ def get_calendar(when=""):
     return calendar_tool.get_calendar(when)
 
 
+# ── calendar event creation (two-step: stage, then the user says yes) ──
+PENDING_EVENT_SECONDS = 90
+_pending_event = None          # (calendar_tool.EventPlan, staged_at)
+_YES_RE = re.compile(r"^\W*(?:yes|yeah|yep|yup|sure|ok(?:ay)?|confirm(?:ed)?|do it|go ahead|add it|"
+                     r"please do|correct|that'?s right)\b(?:\W+(?:please|jarvis|thanks?))*\W*$", re.I)
+_NO_RE = re.compile(r"^\W*(?:no|nope|nah|cancel(?: it| that)?|don'?t|never ?mind|stop|forget it)\b.*$", re.I)
+
+
+def add_calendar_event(title="", when=""):
+    """Stage an event; nothing is written until the user confirms."""
+    global _pending_event
+    title, when = (title or "").strip(), (when or "").strip()
+    if title.lower() in {"title", "event", "name"}:
+        title = ""
+    if not when or when.lower() in {"when", "date", "time"}:
+        # One argument ("team sync tomorrow at 4 pm") holds both parts; with
+        # none, the user's own words do. plan_event strips the date/time out
+        # of the title when title and when are the same text.
+        when = title or _current_goal
+        title = when
+    try:
+        plan = calendar_tool.plan_event(title, when, user_text=_current_goal)
+    except calendar_tool.EventParseError as e:
+        return f"Could not schedule that: {e}."
+    _pending_event = (plan, time.time())
+    hud_log("CAL", f"Pending: {plan.title} {plan.day} {plan.start or 'all day'}-{plan.end}")
+    parts = [f"Shall I add {plan.spoken()}?"]
+    if plan.notes:
+        parts.insert(0, "Note: " + "; ".join(plan.notes) + ".")
+    if plan.clashes:
+        parts.insert(-1, "It clashes with " + " and ".join(plan.clashes) + ".")
+    return "CONFIRM: " + " ".join(parts) + " Say yes or no."
+
+
+def handle_pending_event(user_text):
+    """Called before the LLM. Returns a reply if this utterance answered a
+    staged event, else None. Anything other than yes/no drops the staged event."""
+    global _pending_event
+    if _pending_event is None:
+        return None
+    plan, staged_at = _pending_event
+    _pending_event = None
+    if time.time() - staged_at > PENDING_EVENT_SECONDS:
+        log.info("Pending calendar event expired: %s", plan.title)
+        return None
+    if _YES_RE.match(user_text or ""):
+        try:
+            reply = calendar_tool.add_event(plan)
+        except calendar_tool.CalendarError as e:
+            log.error("khal new failed: %s", e)
+            return f"I couldn't add it: {e}."
+        if _reactor is not None:
+            _reactor.refresh_panels()
+        hud_tool("add_calendar_event", plan.title, reply)
+        return reply
+    if _NO_RE.match(user_text or ""):
+        return "Okay, I won't add it."
+    log.info("Pending calendar event dropped by a new request: %s", plan.title)
+    return None
+
+
 def daily_briefing(dummy=None):
     """One call that gathers everything for a spoken briefing: date and time,
     weather, today's calendar (with clashes), what's next, unread mail (if set
@@ -849,6 +910,7 @@ def daily_briefing(dummy=None):
 
 TOOLS = {
     "get_calendar":    get_calendar,
+    "add_calendar_event": add_calendar_event,
     "get_unread_email": mail_tool.get_unread_email,
     "daily_briefing":  daily_briefing,
     "remember":        remember,
@@ -894,6 +956,7 @@ SYSTEM_PROMPT = """You are Jarvis, a personal AI assistant.
 """ + (PERSONA + "\n" if PERSONA else "") + """
 AVAILABLE TOOLS:
 - get_calendar|when          (events, schedule, meetings, exams: when = today, tomorrow, friday, this week, 20 november)
+- add_calendar_event|title|when  (schedule / add / book an event: title = what, when = day and time, e.g. tomorrow at 4 pm)
 - get_unread_email|          (unread mail: how many, and who the newest are from)
 - daily_briefing|            (good morning / brief me / how does my day look: weather + today's calendar + unread mail + battery in one call)
 - remember|fact              (store something the user asks you to remember)
@@ -975,6 +1038,9 @@ You: TOOL: get_calendar|tomorrow
 
 User: Tool result: Tomorrow: 2 events. 11 AM to 12 PM: Team sync. 11:30 AM to 1 PM: Lab review. CLASHES: 'Team sync' overlaps 'Lab review'.
 You: DONE: You have two things tomorrow, a team sync at 11 and a lab review at 11:30, and those two overlap.
+
+User: schedule a team sync tomorrow at 4 PM
+You: TOOL: add_calendar_event|team sync|tomorrow at 4 pm
 
 User: good morning
 You: TOOL: daily_briefing|
@@ -1097,6 +1163,15 @@ def _run_agent_locked(user_goal, after_state=None):
     hud(HUDState.THINKING)
     hud_log("USER", user_goal)
 
+    # A staged calendar event is confirmed or cancelled here, never by the LLM,
+    # so a misheard reply cannot create an event the user did not agree to.
+    reply = handle_pending_event(user_goal)
+    if reply:
+        _memory.record_exchange(user_goal, reply)
+        hud_log("DONE", reply)
+        speak(reply, then=after_state)
+        return reply
+
     # Explicit memory trigger — bypass the LLM entirely so "remember that..." is deterministic
     fact = _memory.extract_explicit_memory(user_goal)
     if fact:
@@ -1185,6 +1260,14 @@ def _run_agent_locked(user_goal, after_state=None):
                 print(f"✅ Result: {result}")
                 log.info("TOOL %s(%s) -> %s", tool_name, tool_args, str(result)[:200])
                 hud_tool(tool_name, ", ".join(tool_args), str(result)[:80])
+                # "CONFIRM: ..." is spoken word for word: a small model could
+                # turn "shall I add it?" into "I've added it".
+                if isinstance(result, str) and result.startswith("CONFIRM:"):
+                    final = result[len("CONFIRM:"):].strip()
+                    _memory.record_exchange(user_goal, final)
+                    hud_log("DONE", final)
+                    speak(final, then=after_state)
+                    return final
                 messages.append({
                     "role": "user",
                     "content": f"Tool result: {result}. Now respond with DONE: if complete.",
