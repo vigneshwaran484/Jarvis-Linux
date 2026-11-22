@@ -1,3 +1,4 @@
+import json
 import re
 import requests
 import subprocess
@@ -9,35 +10,48 @@ import os
 import shutil
 import threading
 import time
+import tempfile
+import urllib.parse
 import psutil
-import cv2
-import numpy as np
 from pathlib import Path
 from datetime import datetime
 
 from reactor import ArcReactor, HUDState
-from wakeword import listen_for_wake_word_multi, get_microphone_index, get_microphone_details
+from wakeword import (
+    listen_for_wake_word_continuous, listen_for_wake_word_google_stt,
+    init_detector, is_detector_ready,
+    get_microphone_details, FilteredMicrophone
+)
 from memory import MemoryManager
+from tts_stream import StreamingSpeaker, synthesize_clip, play_file, current_epoch, stop_speaking
+import voice_local
 from jarvis_log import log
+from circuit_breaker import CircuitBreaker, CircuitOpenError
+import web_search
+import calendar_tool
+import hypr_ipc
+import screen_tool
+import mail_tool
 from config import (
     SCREENSHOT_DIR, VIDEO_DIR,
-    LLM_MODEL, LLM_ENDPOINT, LLM_MAX_STEPS, LLM_TIMEOUT,
+    LLM_MODEL, LLM_ENDPOINT, LLM_MAX_STEPS, LLM_TIMEOUT, LLM_THINK, PERSONA, HOME_CITY,
+    LLM_CIRCUIT_FAILURE_THRESHOLD, LLM_CIRCUIT_RECOVERY_SECONDS,
     TTS_VOICE, STT_LANGUAGE, PHRASE_TIME_LIMIT, STT_MIN_CONFIDENCE,
+    STT_ENGINE, TTS_ENGINE, WHISPER_MIN_CONFIDENCE,
+    WAKEWORD_ENABLED, WAKEWORD_MODEL, WAKEWORD_THRESHOLD,
     WAKE_WORDS, ALLOWED_APPS, ALLOWED_WRITE_EXTENSIONS,
 )
 
-# TODO(wake-word): swap listen_for_wake_word_multi (Google STT polling) for an
-#   offline engine — Porcupine (pvporcupine.create(keywords=["jarvis"])) or
-#   openWakeWord (Model(wakeword_models=["hey_jarvis"])). Both expose a
-#   per-frame predict() that fits the same `block until detected` contract used
-#   in agent_loop(), so only wakeword.py needs to change.
-# TODO(hyprland-ipc): add tools that talk to Hyprland over its IPC socket
-#   ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock) instead of
-#   shelling out to hyprctl/ydotool — e.g. focus_window|title, move_to_workspace|n,
-#   list_windows|. Register them in TOOLS and the SYSTEM_PROMPT tool list.
-# TODO(streaming-tts): edge_tts.Communicate.stream() yields audio chunks; pipe
-#   them into a persistent `mpv --idle` (or pygame stream) so speech starts
-#   before synthesis finishes. speak() is the single choke point to change.
+# DONE(wake-word): implemented openWakeWord-based detection in wakeword.py
+#   Falls back to Google STT if openWakeWord model fails to load.
+#   Hotkey (SUPER+J) remains as a manual override/fallback.
+# DONE(hyprland-ipc): hypr_ipc.py talks to Hyprland's socket directly —
+#   list_windows, focus_window, move_window_to_workspace; change_window and
+#   special_screen use it too (ydotool kept only as a fallback).
+# DONE(streaming-tts): sentence-pipelined playback implemented in
+#   tts_stream.py (StreamingSpeaker), fed from ask_llm()'s Ollama streaming
+#   mode via the _DoneSpeechRouter below. speak() itself is unchanged and
+#   still used for short deterministic messages and as the fallback path.
 
 # Suppress ALSA warnings emitted by C libraries during audio initialization
 import ctypes
@@ -58,6 +72,8 @@ VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 # Module-level reactor / memory references — set in __main__
 _reactor = None
 _memory: MemoryManager = None
+_agent_lock = threading.Lock()
+_manual_wake = threading.Event()
 
 
 def hud(state, detail=""):
@@ -66,28 +82,54 @@ def hud(state, detail=""):
         _reactor.set_state(state, detail)
 
 
+def hud_log(kind: str, text: str):
+    """Push a trace event to the HUD command center (no-op when headless)."""
+    if _reactor and hasattr(_reactor, "log_event"):
+        _reactor.log_event(kind, text)
+
+
+def hud_tool(tool_name: str, args_str: str = "", result_str: str = ""):
+    """Highlight a tool node in the HUD neural topology graph."""
+    if _reactor and hasattr(_reactor, "notify_tool"):
+        _reactor.notify_tool(tool_name, args_str, result_str)
+
+
 # ─────────────────────────────────────────
 # 1. SPEAK  (fixes speaking state + temp file cleanup)
 # ─────────────────────────────────────────
 
-async def _speak_edge(text, tmp_path):
-    await edge_tts.Communicate(text, TTS_VOICE).save(str(tmp_path))
+def speak(text, then=None, gen_start_ts=None):
+    """Synthesise + play `text` as a single blocking clip. HUD shows SPEAKING,
+    then returns to `then` (or whatever state was active before the call).
 
-def speak(text, then=None):
-    """Synthesise + play `text`. HUD shows SPEAKING, then returns to `then`
-    (or whatever state was active before the call)."""
+    Used for short deterministic messages (memory confirmations, errors) and
+    as the fallback when streaming TTS (see run_agent/StreamingSpeaker) isn't
+    used or its first chunk fails. gen_start_ts, if given, is logged against
+    the moment playback actually starts — lets jarvis.log show this old
+    blocking path's full latency for comparison against streaming's
+    'first audio playback started' log line.
+    """
     print(f"🔊 Jarvis: {text}")
     log.info("SPEAK: %s", text)
 
     prev_state = then or (_reactor.state if _reactor else None)
+    epoch = current_epoch()          # a barge-in stop after this point cancels this clip
     hud(HUDState.SPEAKING)
 
-    tmp_path = Path("_jarvis_response.mp3")
+    # Unique temp file: a fixed ./_jarvis_response.mp3 depended on the cwd and
+    # could be left behind (or clobbered) if two speak() calls overlapped.
+    fd, tmp_name = tempfile.mkstemp(prefix="jarvis_", suffix=".audio")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
     try:
-        asyncio.run(_speak_edge(text, tmp_path))
-        # Use mpv for reliable audio playback on Linux
-        subprocess.run(["mpv", "--no-terminal", "--quiet", str(tmp_path)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Piper (local) or edge-tts (online fallback); mpv detects the format
+        audio_bytes, _ext = synthesize_clip(text, TTS_VOICE)
+        tmp_path.write_bytes(audio_bytes)
+        if gen_start_ts is not None:
+            log.info("Blocking TTS: audio playback started %.2fs after generation began",
+                     time.time() - gen_start_ts)
+        # mpv, registered so stop_speaking() (HUD click / Esc / SIGUSR1) can cut it off
+        play_file(tmp_path, epoch)
     except Exception as e:
         print(f"⚠️  TTS error: {e}")
         log.exception("TTS failure")
@@ -113,18 +155,30 @@ def listen():
     hud(HUDState.LISTENING)
     try:
         mic_idx, sample_rate = get_microphone_details()
-        mic = sr.Microphone(device_index=mic_idx, sample_rate=sample_rate)
-    except Exception as e:
+        mic = FilteredMicrophone(device_index=mic_idx, sample_rate=sample_rate)
+    except Exception:
         log.exception("Microphone init failed")
         return None, "mic_error"
 
-    with mic as source:
+    try:
+        mic.__enter__()  # opening the stream can itself raise (device busy, unplugged)
+    except Exception:
+        log.exception("Microphone open failed")
+        return None, "mic_error"
+
+    try:
+        source = mic
         print("🎤 Listening...")
         _listen_recognizer.adjust_for_ambient_noise(source, duration=0.3)
         try:
             audio = _listen_recognizer.listen(
                 source, timeout=6, phrase_time_limit=PHRASE_TIME_LIMIT
             )
+            if STT_ENGINE == "whisper" and voice_local.stt_ready():
+                try:
+                    return _transcribe_local(audio)
+                except Exception:
+                    log.exception("Local STT failed; falling back to Google STT")
             # show_all=True exposes Google's confidence so we can reject mumbling
             raw = _listen_recognizer.recognize_google(audio, language=STT_LANGUAGE, show_all=True)
             alternatives = raw.get("alternative", []) if isinstance(raw, dict) else []
@@ -153,6 +207,29 @@ def listen():
             print(f"⚠️  STT error: {e}")
             log.error("STT request error: %s", e)
             return None, "stt_error"
+    finally:
+        try:
+            mic.__exit__(None, None, None)
+        except Exception:
+            pass
+
+
+def _transcribe_local(audio):
+    """Whisper on this machine. Same (text, reason) contract as listen()."""
+    t0 = time.time()
+    text, confidence = voice_local.transcribe(audio)
+    took = time.time() - t0
+    if not text:
+        print("❓ Couldn't understand")
+        log.warning("Whisper heard no speech (%.2fs)", took)
+        return None, "unclear"
+    if confidence < WHISPER_MIN_CONFIDENCE:
+        print(f"❓ Low confidence ({confidence:.2f}): {text}")
+        log.warning("Whisper low confidence %.2f for %r", confidence, text)
+        return None, "low_confidence"
+    print(f"✅ You said: {text}  (conf {confidence:.2f}, {took:.1f}s local)")
+    log.info("STT(whisper): %r conf=%.2f in %.2fs", text, confidence, took)
+    return text, None
 
 
 # ─────────────────────────────────────────
@@ -160,24 +237,95 @@ def listen():
 # ─────────────────────────────────────────
 
 class LLMError(RuntimeError):
-    """Raised by ask_llm; message is a short reason (unreachable | timeout | error: ...)."""
+    """Raised by ask_llm; message is a short reason:
+    unreachable | timeout | server_error | model_missing | circuit_open | error: ..."""
 
 
-def ask_llm(messages):
+# Reasons that mean "Ollama itself is unhealthy" — these trip the breaker.
+# model_missing / other errors are config problems; failing fast won't help.
+_BACKEND_DOWN = {"unreachable", "timeout", "server_error"}
+
+_llm_breaker = CircuitBreaker(
+    "ollama",
+    failure_threshold=LLM_CIRCUIT_FAILURE_THRESHOLD,
+    recovery_timeout=LLM_CIRCUIT_RECOVERY_SECONDS,
+)
+
+
+def ask_llm(messages, on_token=None):
+    """ask_llm through the circuit breaker: after repeated Ollama outages it
+    raises LLMError("circuit_open") instantly instead of waiting LLM_TIMEOUT."""
     try:
+        return _llm_breaker.call(
+            _ask_llm_raw, messages, on_token,
+            is_failure=lambda e: isinstance(e, LLMError) and str(e) in _BACKEND_DOWN,
+        )
+    except CircuitOpenError as e:
+        log.warning("Skipping Ollama call: %s", e)
+        raise LLMError("circuit_open") from e
+
+
+def _ask_llm_raw(messages, on_token=None):
+    """
+    Call Ollama's /api/chat in streaming mode. If `on_token` is given, it's
+    invoked with each incremental text chunk as it arrives — this is what
+    lets run_agent() pipeline TTS playback while generation is still in
+    progress (see _DoneSpeechRouter below).
+
+    Always returns the FULL accumulated response text (stripped), exactly
+    like the old blocking (stream=False) version did — the ReAct loop's
+    TOOL:/DONE: parsing further down is untouched, it still runs on this
+    complete string after ask_llm() returns. Only how the bytes arrive
+    changed, not the response contract.
+    """
+    try:
+        payload = {"model": LLM_MODEL, "messages": messages, "stream": True}
+        if LLM_THINK is not None:
+            # Reasoning models (qwen3, ...) think before answering unless told
+            # not to; that adds seconds before the first spoken word.
+            payload["think"] = LLM_THINK
         resp = requests.post(
             LLM_ENDPOINT,
-            json={"model": LLM_MODEL, "messages": messages, "stream": False},
+            json=payload,
             timeout=LLM_TIMEOUT,
+            stream=True,
         )
+        if resp.status_code == 404:
+            # Ollama answers 404 when the model isn't pulled
+            log.error("Ollama model %r not found (404): %s", LLM_MODEL, resp.text[:200])
+            raise LLMError("model_missing")
+        if resp.status_code >= 500:
+            log.error("Ollama server error %d: %s", resp.status_code, resp.text[:200])
+            raise LLMError("server_error")
         resp.raise_for_status()
-        return resp.json()["message"]["content"].strip()
+
+        parts = []
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                log.warning("Ollama stream: unparseable line, skipping: %r", line[:200])
+                continue
+
+            token = data.get("message", {}).get("content", "")
+            if token:
+                parts.append(token)
+                if on_token:
+                    on_token(token)
+            if data.get("done"):
+                break
+
+        return "".join(parts).strip()
     except requests.exceptions.ConnectionError as e:
         log.error("Ollama unreachable at %s: %s", LLM_ENDPOINT, e)
         raise LLMError("unreachable")
     except requests.exceptions.Timeout:
         log.error("Ollama timed out after %.0fs (model=%s)", LLM_TIMEOUT, LLM_MODEL)
         raise LLMError("timeout")
+    except LLMError:
+        raise
     except Exception as e:
         log.exception("LLM error")
         raise LLMError(f"error: {e}")
@@ -187,8 +335,11 @@ def ask_llm(messages):
 # 4. TOOLS
 # ─────────────────────────────────────────
 
-def open_app(app_name):
-    app_name = app_name.strip().lower()
+def open_app(app_name=""):
+    app_name = (app_name or "").strip().lower()
+    if len(app_name) < 2:
+        # An empty name would match the first .desktop file found
+        return "Which app should I open?"
 
     # System apps for Linux/Garuda (using generic names and some KDE defaults)
     system_apps = {
@@ -237,8 +388,8 @@ def open_app(app_name):
     except FileNotFoundError:
         return f"Could not find '{app_name}' on this PC."
 
-def close_app(app_name):
-    app_name = app_name.strip().lower()
+def close_app(app_name=""):
+    app_name = (app_name or "").strip().lower()
     # Build a set of possible exact process names to match against
     targets = set()
     mapped = ALLOWED_APPS.get(app_name)
@@ -280,23 +431,43 @@ def close_app(app_name):
         return f"Closed {app_name} ({killed} process{'es' if killed > 1 else ''})"
     return f"Could not close {app_name} — it may not be running."
 
-def search_web(query):
-    import urllib.parse
+def open_in_browser(query=""):
+    """Open a Google search for `query` in the default browser."""
+    query = (query or "").strip() or _current_goal
     webbrowser.open(f"https://www.google.com/search?q={urllib.parse.quote(query)}")
-    return f"Searched Google for: {query}"
+    return f"Opened a Google search for '{query}' in the browser."
 
-def write_file(filename, content):
-    path = Path(filename.strip())
+def search_web(query=""):
+    """Look `query` up and return a text answer the LLM can summarise aloud.
+    Falls back to opening the browser when no backend finds anything."""
+    query = (query or "").strip()
+    if not query or query.lower() in _PLACEHOLDER_ARGS:
+        query = _current_goal
+    hud(HUDState.THINKING, "searching the web")
+    snippet, source = web_search.lookup(query)
+    if snippet:
+        return f"Search result ({source}): {snippet}"
+    open_in_browser(query)
+    return f"No direct answer found for '{query}', so I opened a Google search in the browser."
+
+def write_file(filename="", content=""):
+    filename = (filename or "").strip()
+    if not filename:
+        return "Filename is required."
+    path = Path(filename)
     # Security: only allow safe extensions and no path traversal
     if path.suffix.lower() not in ALLOWED_WRITE_EXTENSIONS:
         return f"Cannot write '{path.suffix}' files. Allowed: {ALLOWED_WRITE_EXTENSIONS}"
     if path.is_absolute() or ".." in path.parts:
         return "Cannot write to that path. Relative paths only."
-    path.write_text(content, encoding="utf-8")
+    path.write_text(str(content or ""), encoding="utf-8")
     return f"File '{filename}' created"
 
-def read_file(filename):
-    path = Path(filename.strip())
+def read_file(filename=""):
+    filename = (filename or "").strip()
+    if not filename:
+        return "Filename is required."
+    path = Path(filename)
     if path.is_absolute() or ".." in path.parts:
         return "Cannot read that path."
     try:
@@ -306,8 +477,8 @@ def read_file(filename):
     except Exception as e:
         return f"Could not read file: {e}"
 
-def get_system_stats():
-    cpu = psutil.cpu_percent(interval=1)
+def get_system_stats(dummy=None):
+    cpu = psutil.cpu_percent(interval=0.2)
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
     return (
@@ -374,7 +545,18 @@ def stop_recording(dummy=None):
     _recording_process = None
     return "Screen recording stopped and saved to your video folder."
 
+# Open-Meteo's geocoder only knows the current names of renamed cities, while
+# speech recognition usually produces the old ones.
+_CITY_ALIASES = {
+    "bangalore": "Bengaluru", "bombay": "Mumbai", "madras": "Chennai",
+    "calcutta": "Kolkata", "poona": "Pune", "mysore": "Mysuru",
+    "trivandrum": "Thiruvananthapuram", "gurgaon": "Gurugram",
+    "cochin": "Kochi", "pondicherry": "Puducherry",
+}
+
 def get_weather(city=None):
+    city = (city or "").strip() or HOME_CITY
+    city = _CITY_ALIASES.get(city.lower(), city)
     try:
         if not city:
             loc = requests.get("https://ipwho.is/", timeout=5).json()
@@ -385,45 +567,57 @@ def get_weather(city=None):
         else:
             # Use Open-Meteo geocoding instead of a hardcoded dict
             geo = requests.get(
-                f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1",
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 5},
                 timeout=5,
             ).json()
             results = geo.get("results")
             if not results:
                 return f"Could not find city '{city}'."
-            lat  = results[0]["latitude"]
-            lon  = results[0]["longitude"]
-            city = results[0]["name"]
+            # Same-named villages exist everywhere ("Bangalore Town"); the
+            # most populous match is almost always the city the user meant.
+            best = max(results, key=lambda r: r.get("population") or 0)
+            lat  = best["latitude"]
+            lon  = best["longitude"]
+            city = best["name"]
 
+        # `current=` gives humidity for *now*; the old hourly[0] was midnight's value
         data = requests.get(
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
-            f"&current_weather=true&hourly=relative_humidity_2m",
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+            },
             timeout=5,
         ).json()
 
-        w    = data["current_weather"]
-        humidity = data["hourly"]["relative_humidity_2m"][0]
+        c = data["current"]
+        w = {"weathercode": c["weather_code"], "temperature": c["temperature_2m"],
+             "windspeed": c["wind_speed_10m"]}
+        humidity = c["relative_humidity_2m"]
         desc = {
             0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
             45: "foggy", 48: "foggy", 51: "light drizzle", 53: "moderate drizzle",
-            61: "light rain", 63: "moderate rain", 65: "heavy rain",
-            80: "rain showers", 95: "thunderstorm",
+            55: "dense drizzle", 61: "light rain", 63: "moderate rain", 65: "heavy rain",
+            71: "light snow", 73: "moderate snow", 75: "heavy snow",
+            80: "light rain showers", 81: "rain showers", 82: "violent rain showers",
+            95: "thunderstorm", 96: "thunderstorm with hail", 99: "thunderstorm with heavy hail",
         }.get(w["weathercode"], "mixed conditions")
 
         return (
             f"Weather in {city}: {desc}. "
-            f"Temperature {w['temperature']}°C. "
+            f"Temperature {w['temperature']}°C, feels like {c['apparent_temperature']}°C. "
             f"Wind {w['windspeed']} km/h. "
             f"Humidity {humidity}%."
         )
     except Exception as e:
         return f"Could not fetch weather: {e}"
 
-def set_volume(level):
+def set_volume(level=50):
     """Set system volume to a percentage (0-100)."""
     try:
-        level = max(0, min(100, int(level)))
+        m = re.search(r"\d+", str(level))
+        level = max(0, min(100, int(m.group(0)) if m else 50))
         # Try wpctl (Pipewire) first, then amixer
         if shutil.which("wpctl"):
             subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{level/100:.2f}"])
@@ -472,10 +666,11 @@ def mute_toggle(dummy=None):
     except Exception as e:
         return f"Could not toggle mute: {e}"
 
-def set_brightness(level):
+def set_brightness(level=70):
     """Set screen brightness (0-100)."""
     try:
-        level = max(0, min(100, int(level)))
+        m = re.search(r"\d+", str(level))
+        level = max(0, min(100, int(m.group(0)) if m else 70))
         try:
             import screen_brightness_control as sbc
             sbc.set_brightness(level)
@@ -542,37 +737,49 @@ def simulate_keybind(combo):
         "1": "2", "2": "3", "3": "4", "4": "5", "5": "6",
         "6": "7", "7": "8", "8": "9", "9": "10", "0": "11"
     }
+    if not shutil.which("ydotool"):
+        raise RuntimeError("ydotool is not installed (sudo pacman -S ydotool)")
     keys = combo.lower().split("+")
     args = ["ydotool", "key"]
     for k in keys:
         if k in keycodes: args.append(f"{keycodes[k]}:1")
     for k in reversed(keys):
         if k in keycodes: args.append(f"{keycodes[k]}:0")
-    subprocess.run(args)
+    subprocess.run(args, check=True)
 
-def change_window(number):
-    """Change window (win+number)."""
-    simulate_keybind(f"win+{number}")
-    return f"Changed window to {number}."
+def change_window(number="1"):
+    """Switch to workspace N over Hyprland IPC; fall back to the win+N keypress."""
+    try:
+        hypr_ipc.socket_path()
+    except hypr_ipc.HyprError:
+        simulate_keybind(f"win+{number}")      # no Hyprland socket: old keypress path
+        return f"Changed window to {number}."
+    return hypr_ipc.focus_workspace(number)
 
-def change_desktop(number):
+def change_desktop(number="1"):
     """Change desktop (ctrl+win+number)."""
     simulate_keybind(f"ctrl+win+{number}")
     return f"Changed desktop to {number}."
 
-def special_screen(dummy=None):
-    """Change to special screen (win+s)."""
-    try:
-        subprocess.run(["hyprctl", "dispatch", "togglespecialworkspace"])
-        return "Changed to special screen."
-    except Exception as e:
-        return f"Could not toggle special screen: {e}"
+def special_screen(name=None):
+    """Show / hide a special workspace (default 'special'; 'music' is Spotify's).
+    The old `hyprctl dispatch togglespecialworkspace` is rejected by Hyprland's
+    Lua config syntax, so this goes through hypr_ipc."""
+    name = (name or "").strip().lower()
+    if name in ("", "name", "special", "special screen", "scratchpad"):
+        name = "special"
+    return hypr_ipc.toggle_special(name)
 
 
-def remember(text):
+_PLACEHOLDER_ARGS = {"fact", "text", "query", "memory", "argument", "value"}
+
+def remember(text=""):
     """Store an explicit long-term memory."""
-    if not text or not text.strip():
-        return "Nothing to remember."
+    text = (text or "").strip()
+    # Small models sometimes echo the prompt's placeholder ("remember|fact")
+    # instead of a real fact — refuse rather than store junk.
+    if not text or text.lower() in _PLACEHOLDER_ARGS:
+        return "Nothing to remember — say the fact itself, e.g. 'remember that my meeting is at 5'."
     entry = _memory.add_memory(text)
     return f"Remembered: {entry.text}"
 
@@ -595,13 +802,125 @@ def forget_memory(query=""):
     return f"Forgot: {entry.text}" if entry else "No stored memory matches that."
 
 
+def get_calendar(when=""):
+    """Events on the local khal calendar for today/tomorrow/a weekday/a date/this week."""
+    when = (when or "").strip()
+    # Small models sometimes echo the placeholder ("get_calendar|when"); the
+    # user's own words still say which day they meant.
+    if not when or when.lower() in {"when", "date", "day", "query", "argument"}:
+        when = _current_goal
+    return calendar_tool.get_calendar(when)
+
+
+# ── calendar event creation (two-step: stage, then the user says yes) ──
+PENDING_EVENT_SECONDS = 90
+_pending_event = None          # (calendar_tool.EventPlan, staged_at)
+_YES_RE = re.compile(r"^\W*(?:yes|yeah|yep|yup|sure|ok(?:ay)?|confirm(?:ed)?|do it|go ahead|add it|"
+                     r"please do|correct|that'?s right)\b(?:\W+(?:please|jarvis|thanks?))*\W*$", re.I)
+_NO_RE = re.compile(r"^\W*(?:no|nope|nah|cancel(?: it| that)?|don'?t|never ?mind|stop|forget it)\b.*$", re.I)
+
+
+def add_calendar_event(title="", when=""):
+    """Stage an event; nothing is written until the user confirms."""
+    global _pending_event
+    title, when = (title or "").strip(), (when or "").strip()
+    if title.lower() in {"title", "event", "name"}:
+        title = ""
+    if not when or when.lower() in {"when", "date", "time"}:
+        # One argument ("team sync tomorrow at 4 pm") holds both parts; with
+        # none, the user's own words do. plan_event strips the date/time out
+        # of the title when title and when are the same text.
+        when = title or _current_goal
+        title = when
+    try:
+        plan = calendar_tool.plan_event(title, when, user_text=_current_goal)
+    except calendar_tool.EventParseError as e:
+        return f"Could not schedule that: {e}."
+    _pending_event = (plan, time.time())
+    hud_log("CAL", f"Pending: {plan.title} {plan.day} {plan.start or 'all day'}-{plan.end}")
+    parts = [f"Shall I add {plan.spoken()}?"]
+    if plan.notes:
+        parts.insert(0, "Note: " + "; ".join(plan.notes) + ".")
+    if plan.clashes:
+        parts.insert(-1, "It clashes with " + " and ".join(plan.clashes) + ".")
+    return "CONFIRM: " + " ".join(parts) + " Say yes or no."
+
+
+def handle_pending_event(user_text):
+    """Called before the LLM. Returns a reply if this utterance answered a
+    staged event, else None. Anything other than yes/no drops the staged event."""
+    global _pending_event
+    if _pending_event is None:
+        return None
+    plan, staged_at = _pending_event
+    _pending_event = None
+    if time.time() - staged_at > PENDING_EVENT_SECONDS:
+        log.info("Pending calendar event expired: %s", plan.title)
+        return None
+    if _YES_RE.match(user_text or ""):
+        try:
+            reply = calendar_tool.add_event(plan)
+        except calendar_tool.CalendarError as e:
+            log.error("khal new failed: %s", e)
+            return f"I couldn't add it: {e}."
+        if _reactor is not None:
+            _reactor.refresh_panels()
+        hud_tool("add_calendar_event", plan.title, reply)
+        return reply
+    if _NO_RE.match(user_text or ""):
+        return "Okay, I won't add it."
+    log.info("Pending calendar event dropped by a new request: %s", plan.title)
+    return None
+
+
+def daily_briefing(dummy=None):
+    """One call that gathers everything for a spoken briefing: date and time,
+    weather, today's calendar (with clashes), what's next, unread mail (if set
+    up) and battery.
+    Each part fails on its own, so no internet still gives a calendar briefing."""
+    now = datetime.now()
+    parts = [f"Now: {now.strftime('%A %d %B, %I:%M %p').replace(' 0', ' ')}."]
+
+    weather = get_weather()
+    if not weather.startswith("Could not"):
+        parts.append(weather)
+
+    try:
+        events = calendar_tool.fetch_events(now.date(), 1)
+        parts.append("Calendar: " + calendar_tool.summarize(events, "Today", today=now.date()))
+        now_min = now.hour * 60 + now.minute
+        upcoming = [e for e in events if e.minutes() and e.minutes()[0] >= now_min]
+        if upcoming:
+            nxt = upcoming[0]
+            parts.append(f"Next up: {nxt.title} at {calendar_tool._spoken_time(nxt.start)}.")
+        elif events:
+            parts.append("Nothing else scheduled for the rest of today.")
+    except calendar_tool.CalendarError as e:
+        parts.append(f"Calendar unavailable: {e}.")
+
+    if mail_tool.configured():
+        parts.append(mail_tool.get_unread_email())
+
+    battery = psutil.sensors_battery()
+    if battery is not None and (battery.percent < 30 and not battery.power_plugged):
+        parts.append(f"Battery is low at {int(battery.percent)}% and not charging.")
+    elif battery is not None:
+        parts.append(get_battery())
+    return " ".join(parts)
+
+
 TOOLS = {
+    "get_calendar":    get_calendar,
+    "add_calendar_event": add_calendar_event,
+    "get_unread_email": mail_tool.get_unread_email,
+    "daily_briefing":  daily_briefing,
     "remember":        remember,
     "recall_memory":   recall_memory,
     "forget_memory":   forget_memory,
     "open_app":        open_app,
     "close_app":       close_app,
     "search_web":      search_web,
+    "open_in_browser": open_in_browser,
     "write_file":      write_file,
     "read_file":       read_file,
     "get_system_stats": get_system_stats,
@@ -619,9 +938,15 @@ TOOLS = {
     "media_play_pause":media_play_pause,
     "media_next":      media_next,
     "media_previous":  media_previous,
-    "change_window":   change_window,
+    "change_workspace": change_window,
+    "change_window":   change_window,     # old name, kept so older habits still work
     "change_desktop":  change_desktop,
     "special_screen":  special_screen,
+    "inspect_screen":  screen_tool.inspect_screen,
+    "list_windows":    hypr_ipc.list_windows,
+    "focus_window":    hypr_ipc.focus_window,
+    "move_to_workspace": hypr_ipc.move_window_to_workspace,
+    "move_window_to_workspace": hypr_ipc.move_window_to_workspace,
 }
 
 
@@ -630,19 +955,25 @@ TOOLS = {
 # ─────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are Jarvis, a personal AI assistant.
-
+""" + (PERSONA + "\n" if PERSONA else "") + """
 AVAILABLE TOOLS:
+- get_calendar|when          (events, schedule, meetings, exams: when = today, tomorrow, friday, this week, 20 november)
+- add_calendar_event|title|when  (schedule / add / book an event: title = what, when = day and time, e.g. tomorrow at 4 pm)
+- get_unread_email|          (unread mail: how many, and who the newest are from)
+- daily_briefing|            (good morning / brief me / how does my day look: weather + today's calendar + unread mail + battery in one call)
 - remember|fact              (store something the user asks you to remember)
 - recall_memory|query        (search things the user told you earlier)
 - forget_memory|query        (delete a stored memory)
 - open_app|app_name
 - close_app|app_name
-- search_web|query
+- search_web|query           (look up facts, people, places, definitions — returns an answer)
+- open_in_browser|query      (only when the user wants to SEE results in the browser)
 - write_file|filename|content
 - read_file|filename
 - get_system_stats|
 - get_weather|city
 - take_screenshot|filename
+- inspect_screen|question    (READ what is on the screen / in this window: errors, code, text. question = what the user asked)
 - start_recording|
 - stop_recording|
 - set_volume|level           (0-100, e.g. 50)
@@ -652,25 +983,34 @@ AVAILABLE TOOLS:
 - get_datetime|
 - get_battery|
 - lock_screen|
-- media_play_pause|
-- media_next|
-- media_previous|
-- change_window|number       (1-0)
-- change_desktop|number      (1-0)
-- special_screen|
+- media_play_pause|          (pause or resume the music)
+- media_next|                (skip to the next song / next track / skip this song)
+- media_previous|            (go back to the previous song / last track)
+- change_workspace|number    (go / switch to workspace 1-10, e.g. "go to workspace 3")
+- change_desktop|number      (switch to workspace group 1-10)
+- special_screen|name        (show or hide a scratchpad; empty = default, music = Spotify)
+- list_windows|              (what windows / apps are open and on which workspace)
+- focus_window|app_or_title  (jump to an open app: browser, terminal, spotify, vs code, or words from its title)
+- move_to_workspace|number   (move / send THIS window to workspace N, e.g. "send this to workspace 2")
 
 STRICT RESPONSE RULES:
 Rule 1: ALWAYS use a tool to get real information. NEVER make up or assume answers.
 Rule 1b: The ONLY exception: if the user asks about something that is literally written in the
   KNOWN FACTS or RECENT CONVERSATION context, answer it directly with DONE:.
-  Time, date, weather, battery, volume and system stats are NEVER in context — always call the tool.
+  Time, date, weather, battery, volume, calendar and system stats are NEVER in context — always call the tool.
 Rule 2: For weather — call get_weather first. For system stats — call get_system_stats first.
+  For anything about the schedule, events, meetings or exams — call get_calendar first.
+  For general knowledge questions (who/what/where/when) — call search_web first.
 Rule 3: Your ENTIRE response must be ONLY one of these two formats (include the colon):
   TOOL: tool_name|argument
-  DONE: one short sentence summarising what happened
+  DONE: a short spoken reply (one sentence; up to four for calendar or briefing answers)
 Rule 4: No explanation, no thinking, no extra text — only the single line above.
 Rule 5: Only ONE tool per response.
-Rule 6: After a tool result is given, ALWAYS respond with DONE: followed by a short sentence.
+Rule 6: After a tool result is given, ALWAYS respond with DONE: followed by a short spoken reply.
+Rule 6b: For inspect_screen results, answer from the screen text in up to three sentences.
+Rule 7: The reply is read aloud: plain words only, no lists, no markdown, no emoji, no symbols
+  (say "29 degrees" and "80 percent", never "29°C" or "80%").
+  If a calendar result contains CLASHES, always mention the clash.
 
 EXAMPLES:
 User: what's the weather?
@@ -697,6 +1037,48 @@ You: TOOL: get_datetime|
 User: Tool result: Date: Monday... Time: 04:30 PM.
 You: DONE: It is 4:30 in the afternoon.
 
+User: what's on my calendar tomorrow?
+You: TOOL: get_calendar|tomorrow
+
+User: Tool result: Tomorrow: 2 events. 11 AM to 12 PM: Team sync. 11:30 AM to 1 PM: Lab review. CLASHES: 'Team sync' overlaps 'Lab review'.
+You: DONE: You have two things tomorrow, a team sync at 11 and a lab review at 11:30, and those two overlap.
+
+User: schedule a team sync tomorrow at 4 PM
+You: TOOL: add_calendar_event|team sync|tomorrow at 4 pm
+
+User: good morning
+You: TOOL: daily_briefing|
+
+User: Tool result: Now: Monday 2 March, 8:05 AM. Weather in Chennai: clear sky. Temperature 29.0°C... Calendar: Today: 2 events. 10 AM to 11 AM: Lab. 4 PM to 5 PM: Gym. Next up: Lab at 10 AM. Battery is at 80%, charging.
+You: DONE: Good morning, sir. It is 29 degrees and clear in Chennai. You have two things today, a lab at 10 and the gym at 4, with the lab up first. Battery is at 80 percent and charging.
+
+User: what does this error on my screen mean?
+You: TOOL: inspect_screen|what does this error mean
+
+User: Tool result: Text read from Kitty terminal by OCR... ModuleNotFoundError: No module named 'faiss'
+You: DONE: Python cannot find the faiss package, so it is not installed in the environment you are running. Activate the right virtual environment or install faiss-cpu with pip.
+
+User: skip this song
+You: TOOL: media_next|
+
+User: what windows do I have open?
+You: TOOL: list_windows|
+
+User: take me to my browser
+You: TOOL: focus_window|browser
+
+User: move this to workspace 3
+You: TOOL: move_to_workspace|3
+
+User: go to workspace 4
+You: TOOL: change_workspace|4
+
+User: who invented the telephone?
+You: TOOL: search_web|who invented the telephone
+
+User: Tool result: Search result (wikipedia): Alexander Graham Bell ... first practical telephone...
+You: DONE: Alexander Graham Bell is credited with inventing the telephone.
+
 User: what time is my meeting?   (KNOWN FACTS contains: "I have a meeting at 5 pm")
 You: DONE: Your meeting is at 5 pm.
 
@@ -706,17 +1088,99 @@ You: DONE: Your project uses Postgres.
 
 
 # ─────────────────────────────────────────
+# 5b. STREAMING-SPEECH ROUTER
+# ─────────────────────────────────────────
+
+class _DoneSpeechRouter:
+    """
+    Watches the incremental tokens of ONE ask_llm() call (one ReAct step).
+    If the response turns out to start with 'DONE' — i.e. it's the final
+    spoken reply, not a TOOL: call — it engages a StreamingSpeaker and feeds
+    it the spoken text as it streams in, so playback of the first sentence
+    starts while the LLM is still generating the rest.
+
+    This only ever affects DONE: responses. A TOOL: call (or anything else)
+    causes zero audio side effects — ask_llm() still returns the complete
+    accumulated text exactly as before, and run_agent()'s existing
+    TOOL:/DONE: parsing runs on it completely unchanged.
+    """
+    _PREFIX = "DONE"
+
+    def __init__(self, gen_start_ts, after_state=HUDState.LISTENING):
+        self._gen_start_ts = gen_start_ts
+        self._after_state = after_state
+        self._buffer = ""
+        self._decided = False
+        self.is_done_response = False
+        self.speaker: StreamingSpeaker | None = None
+
+    def on_token(self, token: str):
+        if self._decided:
+            if self.is_done_response:
+                self.speaker.feed(token)
+                if _reactor and hasattr(_reactor, "push_token"):
+                    _reactor.push_token(token)
+            return
+
+        self._buffer += token
+        stripped = self._buffer.lstrip()
+        if len(stripped) < len(self._PREFIX):
+            return  # not enough yet to tell TOOL:/DONE apart
+
+        self._decided = True
+        if stripped.startswith(self._PREFIX):
+            self.is_done_response = True
+            # Mirror the exact stripping run_agent() applies to the full
+            # response text below: response[4:].lstrip(":. ")
+            remainder = stripped[len(self._PREFIX):].lstrip(":. ")
+            if _reactor and hasattr(_reactor, "clear_stream"):
+                _reactor.clear_stream()
+            self.speaker = StreamingSpeaker(
+                voice=TTS_VOICE,
+                on_first_audio=lambda: hud(HUDState.SPEAKING),
+                on_finished=lambda: hud(self._after_state),
+                gen_start_ts=self._gen_start_ts,
+            )
+            if remainder:
+                self.speaker.feed(remainder)
+                if _reactor and hasattr(_reactor, "push_token"):
+                    _reactor.push_token(remainder)
+        # else: a TOOL: call or a malformed response — no speech, no speaker.
+
+
+# ─────────────────────────────────────────
 # 6. AGENT LOOP
 # ─────────────────────────────────────────
 
-def run_agent(user_goal):
+def run_agent(user_goal, after_state=None):
     """One ReAct episode. Returns the final spoken reply (or None on failure)."""
+    with _agent_lock:
+        return _run_agent_locked(user_goal, after_state=after_state)
+
+
+def _run_agent_locked(user_goal, after_state=None):
     print(f"\n🎯 Goal: {user_goal}")
     print("─" * 40)
     log.info("GOAL: %s", user_goal)
     global _current_goal
     _current_goal = user_goal
+    if after_state is None:
+        after_state = (
+            HUDState.IDLE
+            if threading.current_thread().name.startswith("hud")
+            else HUDState.LISTENING
+        )
     hud(HUDState.THINKING)
+    hud_log("USER", user_goal)
+
+    # A staged calendar event is confirmed or cancelled here, never by the LLM,
+    # so a misheard reply cannot create an event the user did not agree to.
+    reply = handle_pending_event(user_goal)
+    if reply:
+        _memory.record_exchange(user_goal, reply)
+        hud_log("DONE", reply)
+        speak(reply, then=after_state)
+        return reply
 
     # Explicit memory trigger — bypass the LLM entirely so "remember that..." is deterministic
     fact = _memory.extract_explicit_memory(user_goal)
@@ -724,7 +1188,9 @@ def run_agent(user_goal):
         entry = _memory.add_memory(fact)
         reply = f"Got it. I'll remember that {entry.text}."
         _memory.record_exchange(user_goal, reply)
-        speak(reply)
+        hud_tool("remember", fact, entry.text)
+        hud_log("DONE", reply)
+        speak(reply, then=after_state)
         return reply
 
     # Explicit forget trigger — same reasoning: deletion should be deterministic
@@ -733,7 +1199,9 @@ def run_agent(user_goal):
         entry = _memory.forget(what)
         reply = f"Okay, I've forgotten that {entry.text}." if entry else "I couldn't find a memory matching that."
         _memory.record_exchange(user_goal, reply)
-        speak(reply)
+        hud_tool("forget_memory", what, reply)
+        hud_log("DONE", reply)
+        speak(reply, then=after_state)
         return reply
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -744,13 +1212,27 @@ def run_agent(user_goal):
 
     for step in range(LLM_MAX_STEPS):
         hud(HUDState.THINKING, f"step {step+1}: ollama")
+        step_start = time.time()
+        log.info("Generation started (step %d)", step + 1)
+        router = _DoneSpeechRouter(gen_start_ts=step_start, after_state=after_state)
         try:
-            response = ask_llm(messages)
+            response = ask_llm(messages, on_token=router.on_token)
         except LLMError as e:
             reason = str(e)
+            if router.speaker is not None:
+                # Drop anything not yet queued; already-fully-formed sentences
+                # already playing finish naturally rather than cutting off
+                # mid-word. Don't speak the trailing fragment — the error
+                # message below is what should be heard next.
+                router.speaker.abort()
             hud(HUDState.ERROR, f"ollama {reason}")
             if reason == "unreachable":
                 speak("I'm having trouble thinking right now. Ollama doesn't seem to be running.", then=HUDState.ERROR)
+            elif reason == "circuit_open":
+                speak(f"My brain is still offline. I'll try Ollama again in about "
+                      f"{max(1, round(_llm_breaker.retry_after()))} seconds.", then=HUDState.ERROR)
+            elif reason == "model_missing":
+                speak(f"The model {LLM_MODEL} isn't installed. Run ollama pull {LLM_MODEL}.", then=HUDState.ERROR)
             else:
                 speak("I'm having trouble thinking right now. Please try again in a moment.", then=HUDState.ERROR)
             return None
@@ -764,11 +1246,18 @@ def run_agent(user_goal):
         head = response.split("|", 1)[0].strip()
         head_norm = re.sub(r"^tool\s*:\s*", "", head, flags=re.I).strip().lower().replace(" ", "_")
         if response.startswith("TOOL:") or head_norm in TOOLS:
-            body      = re.sub(r"^tool\s*:\s*", "", response, flags=re.I).strip()
+            # A tool call is always a single line. If the model tacks extra
+            # lines on (e.g. "TOOL: remember|fact\nDONE: ..."), ignore them
+            # instead of stuffing them into the tool's argument.
+            first_line = response.strip().splitlines()[0]
+            body      = re.sub(r"^tool\s*:\s*", "", first_line, flags=re.I).strip()
             parts     = body.split("|")
             tool_name = parts[0].strip().lower().replace(" ", "_")
             # tolerate "key=value" / "key: value" style args the model sometimes emits
             tool_args = [re.sub(r"^\w+\s*[=:]\s*", "", a.strip()) for a in parts[1:]]
+            # Strip trailing empty argument from "TOOL: name|" so 0-arg tools work cleanly
+            if tool_args == [""]:
+                tool_args = []
 
             if tool_name in TOOLS:
                 print(f"🔧 {tool_name}({tool_args})")
@@ -780,6 +1269,15 @@ def run_agent(user_goal):
                     result = f"Tool {tool_name} failed: {e}"
                 print(f"✅ Result: {result}")
                 log.info("TOOL %s(%s) -> %s", tool_name, tool_args, str(result)[:200])
+                hud_tool(tool_name, ", ".join(tool_args), str(result)[:80])
+                # "CONFIRM: ..." is spoken word for word: a small model could
+                # turn "shall I add it?" into "I've added it".
+                if isinstance(result, str) and result.startswith("CONFIRM:"):
+                    final = result[len("CONFIRM:"):].strip()
+                    _memory.record_exchange(user_goal, final)
+                    hud_log("DONE", final)
+                    speak(final, then=after_state)
+                    return final
                 messages.append({
                     "role": "user",
                     "content": f"Tool result: {result}. Now respond with DONE: if complete.",
@@ -799,7 +1297,21 @@ def run_agent(user_goal):
             if not final:
                 final = "Done."
             _memory.record_exchange(user_goal, final)
-            speak(final)
+            hud_log("DONE", final)
+
+            # router.speaker was fed this exact text as it streamed in, and
+            # (per HUD requirement) already flipped the HUD to SPEAKING the
+            # moment the first sentence started playing — well before this
+            # point, which is only reached once the FULL response finished
+            # generating. finish() blocks until all queued audio has played,
+            # then returns False only if the very first chunk failed to
+            # synthesize, in which case we fall back to one plain blocking
+            # speak() call so the reply is never silently dropped.
+            spoken_via_stream = False
+            if router.speaker is not None:
+                spoken_via_stream = router.speaker.finish(default_text_if_empty=final)
+            if not spoken_via_stream:
+                speak(final, then=after_state, gen_start_ts=step_start)
             return final
 
         else:
@@ -816,16 +1328,81 @@ def run_agent(user_goal):
 
 
 # ─────────────────────────────────────────
+# 6b. HUD CLICK HANDLERS
+# ─────────────────────────────────────────
+
+def describe_calendar_item(item):
+    """Spoken line for a calendar row clicked in the HUD (dict from reactor)."""
+    title = item.get("title") or "Untitled"
+    day = item.get("day_long") or "Today"
+    if item.get("all_day") or not item.get("start"):
+        text = f"{day}, all day: {title}."
+    else:
+        text = f"{day} at {calendar_tool._spoken_time(item['start'])}"
+        if item.get("end") and item["end"] != item["start"]:
+            text += f" until {calendar_tool._spoken_time(item['end'])}"
+        text += f": {title}."
+    if item.get("calendar"):
+        text += f" It is on your {item['calendar']} calendar."
+    clash = item.get("clash_with") or []
+    if clash:
+        text += " It overlaps with " + " and ".join(clash) + "."
+    else:
+        text += " No clashes."
+    return text
+
+
+def on_stop_speaking():
+    """Barge-in from the HUD (orb click / Esc) or SIGUSR1. Returns True if
+    something was playing, so an orb click on a silent Jarvis keeps its
+    normal behaviour."""
+    stopped = stop_speaking()
+    if stopped:
+        hud_log("SYS", "Speech stopped.")
+    return stopped
+
+
+def on_hud_calendar_click(item):
+    """Speak the clicked event only while Jarvis is idle. While listening, the
+    mic would transcribe Jarvis's own voice as a command; while a request is
+    running, it would talk over the reply. The details are always in the HUD
+    trace either way."""
+    if _reactor is None or _reactor.state != HUDState.IDLE.value:
+        return
+    if not _agent_lock.acquire(blocking=False):
+        return
+    try:
+        speak(describe_calendar_item(item))
+    finally:
+        _agent_lock.release()
+
+
+# ─────────────────────────────────────────
 # 7. MAIN
 # ─────────────────────────────────────────
 
-if __name__ == "__main__":
-    import sys
+# Whole-word matches only: plain substring checks made "it's quite hot" (quit)
+# shut Jarvis down and "how did I sleep" / "exit the app" misfire.
+_SLEEP_RE    = re.compile(r"\b(?:bye|goodbye|good bye|go to sleep|that'?s all)\b|^\W*sleep\W*$")
+_SHUTDOWN_RE = re.compile(r"^\W*(?:jarvis\W+)?(?:shut ?down|exit|quit)(?:\W+jarvis)?\W*$")
 
-    log.info("=== Jarvis starting (model=%s, stt=%s, tts=%s) ===", LLM_MODEL, STT_LANGUAGE, TTS_VOICE)
+if __name__ == "__main__":
+    log.info("=== Jarvis starting (model=%s, stt=%s, tts=%s, wake_word=%s) ===",
+             LLM_MODEL, STT_ENGINE, TTS_ENGINE, WAKEWORD_MODEL if WAKEWORD_ENABLED else "disabled")
     reactor = ArcReactor()
     _reactor = reactor                     # module globals used by speak()/hud()
     _memory = MemoryManager()              # loads FAISS + JSON stores, warms embedder in background
+    if hasattr(reactor, "set_command_callback"):
+        reactor.set_command_callback(run_agent)
+    reactor.set_memory_delete_callback(_memory.delete_memory)
+    reactor.set_stop_callback(on_stop_speaking)
+    # Global "shut up" hotkey without focusing the HUD, e.g. a Hyprland bind
+    # running:  pkill -USR1 -f agent_v2.py
+    import signal
+    signal.signal(signal.SIGUSR1, lambda *_: on_stop_speaking())
+    reactor.set_event_callback(on_hud_calendar_click)
+    init_detector()                        # initialize openWakeWord model (CPU-only, background thread)
+    voice_local.warm_up(stt=STT_ENGINE == "whisper", tts=TTS_ENGINE in ("piper", "kokoro"))
 
     # Spoken prompts for each listen() failure reason (Part 3.1)
     LISTEN_ERRORS = {
@@ -842,20 +1419,49 @@ if __name__ == "__main__":
 
         while True:
             hud(HUDState.IDLE)
-            print("\n😴 Idle — say 'Hey Jarvis' to wake up")
+            print("\n😴 Idle — say 'Hey Jarvis' to wake up (or press Super+J)")
 
-            # TODO(wake-word): this blocks on Google STT; replace with Porcupine/openWakeWord (see header).
-            try:
-                listen_for_wake_word_multi(WAKE_WORDS)
-            except Exception:
-                log.exception("Wake-word listener crashed; retrying in 3s")
-                reactor.flash_error("wake word", 3)
-                time.sleep(3)
+            # Wake word detection (openWakeWord or Google STT fallback)
+            wake_detected = False
+
+            def on_wake_word_detected():
+                """Callback when openWakeWord detects the wake word."""
+                nonlocal wake_detected
+                wake_detected = True
+
+            def on_wake_word_error(reason):
+                """Callback if wake word detection fails; fall back to Google STT."""
+                nonlocal wake_detected
+                log.warning("Wake word detection failed (%s); falling back to Google STT", reason)
+                hud(HUDState.ERROR, f"wake word: {reason}")
+                time.sleep(1)
+                # Fall back to Google STT polling
+                try:
+                    if listen_for_wake_word_google_stt(WAKE_WORDS):
+                        wake_detected = True
+                except Exception as e:
+                    log.exception("Google STT fallback also failed: %s", e)
+                    wake_detected = False
+
+            # Try openWakeWord-based detection first
+            if is_detector_ready():
+                log.info("Using openWakeWord for wake word detection (model=%s, threshold=%.2f)",
+                         WAKEWORD_MODEL, WAKEWORD_THRESHOLD)
+                listen_for_wake_word_continuous(on_wake_word_detected, on_wake_word_error)
+            else:
+                # Fall back to Google STT if openWakeWord is disabled or failed to load
+                log.info("openWakeWord not ready; using Google STT fallback")
+                if listen_for_wake_word_google_stt(WAKE_WORDS):
+                    wake_detected = True
+
+            if wake_detected:
+                print("✅ Wake word detected!")
+                log.info("Wake word detected — transitioning to listening")
+                speak("Yes, I'm listening.", then=HUDState.LISTENING)
+            else:
+                log.warning("Wake word detection ended without trigger (may be user abort or timeout)")
+                time.sleep(1)
                 continue
-
-            print("✅ Wake word detected!")
-            log.info("Wake word detected")
-            speak("Yes, I'm listening.", then=HUDState.LISTENING)
 
             silent_rounds = 0
             while True:
@@ -881,11 +1487,11 @@ if __name__ == "__main__":
                 is_memory_cmd = (_memory.extract_explicit_memory(lower) is not None
                                  or _memory.extract_forget_command(lower) is not None)
 
-                if not is_memory_cmd and any(w in lower for w in ["bye", "goodbye", "sleep", "that's all"]):
+                if not is_memory_cmd and _SLEEP_RE.search(lower):
                     speak("Okay, going to sleep. Call me when you need me.", then=HUDState.IDLE)
                     break
 
-                if not is_memory_cmd and any(w in lower for w in ["shutdown", "exit", "quit"]):
+                if not is_memory_cmd and _SHUTDOWN_RE.search(lower):
                     speak("Shutting down. Goodbye!", then=HUDState.IDLE)
                     log.info("Shutdown requested by user")
                     reactor.request_close()
