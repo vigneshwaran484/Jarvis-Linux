@@ -50,3 +50,4 @@ _jarvis_response.mp3
 
 # Local Piper voice models (downloaded, ~60 MB each)
 voices/
+*.bak*
